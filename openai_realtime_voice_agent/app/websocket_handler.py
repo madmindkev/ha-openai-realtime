@@ -22,6 +22,7 @@ from app.session_manager import SessionManager
 from app.audio_recording_service import AudioRecordingService
 from app.phase_emitter import PhaseEmitter
 from app.transcript_logger import TranscriptLogger
+from app.homepod_speech_router import HomePodSpeechRouter
 
 logger = logging.getLogger(__name__)
 
@@ -512,6 +513,17 @@ class WebSocketHandler:
         if output_recorder:
             pipeline_components.append(output_recorder)
 
+        # Maison Cognitive:
+        # - Voice PE Cuisine = micro / wake word / LED / contrôle de session
+        # - HomePod Salon = sortie conversationnelle
+        #
+        # Le routeur collecte le texte réellement prononcé par OpenAI et retient
+        # temporairement le PCM qui partirait normalement vers le haut-parleur
+        # du Voice PE. Si Home Assistant accepte la diffusion sur le HomePod,
+        # le PCM PE est supprimé. Si la diffusion HomePod échoue, le PCM est
+        # relâché vers le Voice PE comme solution de secours.
+        pipeline_components.append(HomePodSpeechRouter())
+
         pipeline_components.append(transport.output())
         
         # Add context initializer if we have cached messages
@@ -888,4 +900,3 @@ class WebSocketHandler:
                     await self.transport.stop()
             except Exception as e:
                 logger.warning(f"⚠️ Error stopping transport: {e}")
-
