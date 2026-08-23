@@ -9,7 +9,7 @@ Target architecture:
 - HomePod Salon = conversational loudspeaker.
 - OpenAI Realtime keeps generating audio normally.
 - Conversational speech is rendered by the dedicated Maison Cognitive Morgan
-  TTS entity and played on the Salon HomePod through Home Assistant ``tts.speak``.
+  TTS entity and played on the Salon HomePod.
 - Native OpenAI PCM is held as a fail-safe instead of being played immediately
   by the Voice PE.
 - If Home Assistant accepts the HomePod TTS request, the held PCM is discarded.
@@ -31,9 +31,13 @@ Maison Cognitive refinements:
    grace when it is already a complete sentence; incomplete post-tool fragments
    still get the continuation window so they cannot be spoken mid-sentence.
 5. Empty/duplicate LLM response-end markers are ignored quietly.
-6. ``replying`` begins BEFORE the Home Assistant TTS call. The measured HTTP call
-   duration is subtracted from the estimated playback duration so we never wait
-   for the same speech twice.
+6. Morgan playback uses a fast Home Assistant path first: /api/tts_get_url
+   creates a lazy TTS stream URL, then media_player.play_media starts that stream
+   on the Salon HomePod. This avoids waiting for the entire tts.speak action.
+7. If the fast path fails, the previously validated tts.speak transport is used
+   automatically; Voice PE PCM remains the final fallback.
+8. ``replying`` begins BEFORE HomePod routing. The measured routing call duration
+   is subtracted from the estimated playback duration so we never wait twice.
 
 Tunables:
 - HOMEPOD_PRETOOL_HOLD_SECONDS (default 1.0 s)
@@ -112,9 +116,7 @@ class HomePodSpeechRouter(FrameProcessor):
             "HOMEPOD_PRETOOL_HOLD_MAX_CHARS", 160, minimum=1
         )
 
-        # Longer, targeted guard only for text that looks unfinished. This is what
-        # prevents "Maison Cognitive est l'intelligence de" from being spoken
-        # before "la maison qui..." arrives a couple of seconds later.
+        # Longer, targeted guard only for text that looks unfinished.
         self._continuation_hold_seconds = self._env_float(
             "HOMEPOD_CONTINUATION_HOLD_SECONDS", 3.2, minimum=0.0
         )
@@ -167,7 +169,6 @@ class HomePodSpeechRouter(FrameProcessor):
         if not clean:
             return False
 
-        # Ignore closing quotes/brackets when checking sentence punctuation.
         terminal_probe = clean.rstrip(cls._CLOSING_CHARS).rstrip()
         if terminal_probe.endswith(cls._TERMINAL_PUNCTUATION):
             return False
@@ -180,12 +181,9 @@ class HomePodSpeechRouter(FrameProcessor):
         if words[-1] in cls._CONTINUATION_WORDS:
             return True
 
-        # Very short conversational answers are often complete even when the API
-        # omitted punctuation ("bonjour", "c'est fait", "21 heures 30").
         if len(words) <= 3:
             return False
 
-        # Longer text with no terminal punctuation is safer to treat as unfinished.
         return True
 
     @staticmethod
@@ -212,40 +210,55 @@ class HomePodSpeechRouter(FrameProcessor):
             or os.environ.get("SUPERVISOR_TOKEN", "").strip()
         )
 
-    def _call_home_assistant_sync(self, text: str) -> None:
-        """Render speech with Maison Cognitive Morgan and play it on the HomePod."""
-        token = self._get_ha_token()
-        if not token:
-            raise RuntimeError(
-                "aucun jeton Home Assistant disponible "
-                "(LONGLIVED_TOKEN / SUPERVISOR_TOKEN)"
-            )
-
-        url = f"{self._ha_api_base}/services/tts/speak"
-        body = json.dumps(
-            {
-                "entity_id": self._tts_entity,
-                "media_player_entity_id": self._target_entity,
-                "message": text,
-                "cache": False,
-            }
-        ).encode("utf-8")
-
+    def _request_json_sync(self, url: str, body: dict, token: str) -> dict:
         request = urllib.request.Request(
             url=url,
-            data=body,
+            data=json.dumps(body).encode("utf-8"),
             method="POST",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
         )
-
         try:
-            with urllib.request.urlopen(
-                request,
-                timeout=self._timeout_seconds,
-            ) as response:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                status = response.getcode()
+                payload = response.read()
+                if status < 200 or status >= 300:
+                    raise RuntimeError(f"Home Assistant HTTP {status}")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Home Assistant HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Home Assistant inaccessible: {exc.reason}") from exc
+
+        if not payload:
+            return {}
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("réponse JSON Home Assistant invalide") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("réponse JSON Home Assistant inattendue")
+        return data
+
+    def _request_service_sync(
+        self,
+        domain: str,
+        service: str,
+        body: dict,
+        token: str,
+    ) -> None:
+        request = urllib.request.Request(
+            url=f"{self._ha_api_base}/services/{domain}/{service}",
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
                 status = response.getcode()
                 if status < 200 or status >= 300:
                     raise RuntimeError(f"Home Assistant HTTP {status}")
@@ -253,26 +266,124 @@ class HomePodSpeechRouter(FrameProcessor):
         except urllib.error.HTTPError as exc:
             raise RuntimeError(f"Home Assistant HTTP {exc.code}") from exc
         except urllib.error.URLError as exc:
+            raise RuntimeError(f"Home Assistant inaccessible: {exc.reason}") from exc
+
+    def _call_home_assistant_fast_sync(self, text: str) -> tuple[float, float]:
+        """Create a lazy Morgan stream URL, then start it on the Salon HomePod."""
+        token = self._get_ha_token()
+        if not token:
             raise RuntimeError(
-                f"Home Assistant inaccessible: {exc.reason}"
-            ) from exc
+                "aucun jeton Home Assistant disponible "
+                "(LONGLIVED_TOKEN / SUPERVISOR_TOKEN)"
+            )
+
+        started_url = time.monotonic()
+        tts_data = self._request_json_sync(
+            f"{self._ha_api_base}/tts_get_url",
+            {
+                "engine_id": self._tts_entity,
+                "message": text,
+                "cache": False,
+            },
+            token,
+        )
+        url_elapsed = time.monotonic() - started_url
+
+        media_url = str(tts_data.get("url") or "").strip()
+        if not media_url:
+            raise RuntimeError("/api/tts_get_url n'a renvoyé aucune URL")
+
+        started_play = time.monotonic()
+        self._request_service_sync(
+            "media_player",
+            "play_media",
+            {
+                "entity_id": self._target_entity,
+                "media_content_id": media_url,
+                "media_content_type": "music",
+                "announce": True,
+            },
+            token,
+        )
+        play_elapsed = time.monotonic() - started_play
+        return url_elapsed, play_elapsed
+
+    def _call_home_assistant_legacy_sync(self, text: str) -> None:
+        """Validated fallback: render Morgan through Home Assistant tts.speak."""
+        token = self._get_ha_token()
+        if not token:
+            raise RuntimeError(
+                "aucun jeton Home Assistant disponible "
+                "(LONGLIVED_TOKEN / SUPERVISOR_TOKEN)"
+            )
+
+        self._request_service_sync(
+            "tts",
+            "speak",
+            {
+                "entity_id": self._tts_entity,
+                "media_player_entity_id": self._target_entity,
+                "message": text,
+                "cache": False,
+            },
+            token,
+        )
 
     async def _speak_on_homepod(self, text: str) -> tuple[bool, float]:
         started = time.monotonic()
+
         try:
-            await asyncio.to_thread(self._call_home_assistant_sync, text)
+            url_elapsed, play_elapsed = await asyncio.to_thread(
+                self._call_home_assistant_fast_sync,
+                text,
+            )
             elapsed = time.monotonic() - started
             logger.info(
-                "🏠 HomePod router: Morgan TTS accepté par Home Assistant "
-                f"via {self._tts_entity} vers {self._target_entity} "
-                f"({len(text)} caractères, appel {elapsed:.1f}s)"
+                "🐟 HomePod router: URL Morgan prête en %.2fs via %s",
+                url_elapsed,
+                self._tts_entity,
+            )
+            logger.info(
+                "🍎 HomePod router: play_media accepté en %.2fs vers %s",
+                play_elapsed,
+                self._target_entity,
+            )
+            logger.info(
+                "⚡ HomePod router: fast path Morgan accepté "
+                "(%d caractères, total %.2fs)",
+                len(text),
+                elapsed,
+            )
+            return True, elapsed
+        except Exception as fast_exc:
+            logger.warning(
+                "↩️ HomePod router: fast path Morgan indisponible, "
+                "fallback tts.speak: %r",
+                fast_exc,
+            )
+
+        try:
+            legacy_started = time.monotonic()
+            await asyncio.to_thread(self._call_home_assistant_legacy_sync, text)
+            legacy_elapsed = time.monotonic() - legacy_started
+            elapsed = time.monotonic() - started
+            logger.info(
+                "🏠 HomePod router: Morgan TTS accepté par fallback tts.speak "
+                "via %s vers %s (%d caractères, fallback %.1fs, total %.1fs)",
+                self._tts_entity,
+                self._target_entity,
+                len(text),
+                legacy_elapsed,
+                elapsed,
             )
             return True, elapsed
         except Exception as exc:
             elapsed = time.monotonic() - started
             logger.warning(
                 "⚠️ HomePod router: échec Morgan TTS, "
-                f"fallback Voice PE activé après {elapsed:.1f}s: {exc!r}"
+                "fallback Voice PE activé après %.1fs: %r",
+                elapsed,
+                exc,
             )
             return False, elapsed
 
@@ -387,9 +498,6 @@ class HomePodSpeechRouter(FrameProcessor):
         reason: str,
     ) -> None:
         """Hold a response so tool-race or continuation text can be detected."""
-        # If something is already pending here, merge it rather than silently
-        # replacing it. This protects against sentence/chunk boundaries that do
-        # not come with a clean LLMFullResponseStartFrame.
         previous = self._take_pending_for_merge("nouveau segment à mettre en attente")
         if previous is not None:
             text = self._join_text(previous["text"], text)
@@ -421,9 +529,6 @@ class HomePodSpeechRouter(FrameProcessor):
         hold_seconds = self._hold_seconds_for_text(
             segment["text"], post_tool=bool(segment.get("post_tool"))
         )
-        # Once text is pending, keep at least a tiny race guard even if the newly
-        # merged text became complete. For ordinary text this naturally resolves
-        # to the 1 s pre-tool guard; post-tool complete text can flush immediately.
         segment["hold_seconds"] = hold_seconds
         self._stop_pending_task()
         if hold_seconds <= 0:
@@ -479,9 +584,6 @@ class HomePodSpeechRouter(FrameProcessor):
             return
 
         if isinstance(frame, LLMFullResponseStartFrame):
-            # If no tool was announced, a pending segment followed by another LLM
-            # response is a continuation, not filler. Carry it into the new
-            # response so both pieces are spoken as one utterance.
             carried = None
             if self._pending_segment is not None:
                 if self._next_response_is_post_tool:
@@ -521,9 +623,6 @@ class HomePodSpeechRouter(FrameProcessor):
             if self._response_active and frame.text:
                 self._text_parts.append(frame.text)
             elif self._pending_segment is not None and frame.text:
-                # Some Realtime/Pipecat sequences emit a continuation text chunk
-                # without a fresh FullResponseStartFrame. Merge it directly into
-                # the pending utterance and restart the appropriate timer.
                 segment = self._pending_segment
                 segment["text"] = self._join_text(segment["text"], frame.text)
                 self._refresh_pending_hold(reason="nouveau texte LLM")
@@ -536,8 +635,6 @@ class HomePodSpeechRouter(FrameProcessor):
                 return
 
             if self._pending_segment is not None:
-                # Keep continuation PCM too, so Voice PE fallback remains complete
-                # if Morgan/Home Assistant routing eventually fails.
                 self._pending_segment["audio"].append(frame)
                 return
 
@@ -560,8 +657,6 @@ class HomePodSpeechRouter(FrameProcessor):
             self._response_active = False
             self._reset_current_response()
 
-            # Let the context aggregator close the response immediately. HomePod
-            # routing/fallback can happen after this without blocking tool frames.
             await self.push_frame(frame, direction)
 
             if had_tool_call:
