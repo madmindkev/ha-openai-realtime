@@ -21,17 +21,25 @@ Maison Cognitive refinements:
 1. Short assistant replies are held for a brief grace window before HomePod
    playback. If a tool call starts during that window, the pending text/audio is
    discarded as pre-tool filler ("je vérifie", "une seconde", etc.).
-2. The response that follows a tool call is marked as post-tool and bypasses the
-   grace window, so the useful final answer is spoken without an extra delay.
-3. Empty/duplicate LLM response-end markers are ignored quietly instead of
-   producing misleading fallback warnings.
-4. ``replying`` begins BEFORE the Home Assistant TTS call. Some TTS/media-player
-   stacks block until playback has largely/fully completed; the measured HTTP
-   call duration is therefore subtracted from the estimated playback duration so
-   we never wait for the same speech twice.
+2. Fragmented assistant output is merged before speech. A fragment that looks
+   syntactically unfinished gets a longer continuation window; if more LLM text
+   arrives during that window it is appended to the same pending utterance rather
+   than spoken as a separate HomePod clip.
+3. If a new LLM response starts while a non-tool segment is still pending, the
+   pending text/audio is carried into that response and the two are merged.
+4. The response that follows a tool call bypasses the ordinary 1 s pre-tool
+   grace when it is already a complete sentence; incomplete post-tool fragments
+   still get the continuation window so they cannot be spoken mid-sentence.
+5. Empty/duplicate LLM response-end markers are ignored quietly.
+6. ``replying`` begins BEFORE the Home Assistant TTS call. The measured HTTP call
+   duration is subtracted from the estimated playback duration so we never wait
+   for the same speech twice.
 
-The grace window defaults to 1.0 s for replies up to 160 characters and can be
-adjusted with HOMEPOD_PRETOOL_HOLD_SECONDS / HOMEPOD_PRETOOL_HOLD_MAX_CHARS.
+Tunables:
+- HOMEPOD_PRETOOL_HOLD_SECONDS (default 1.0 s)
+- HOMEPOD_PRETOOL_HOLD_MAX_CHARS (default 160)
+- HOMEPOD_CONTINUATION_HOLD_SECONDS (default 3.2 s)
+- HOMEPOD_CONTINUATION_HOLD_MAX_CHARS (default 420)
 """
 
 import asyncio
@@ -62,6 +70,17 @@ logger = logging.getLogger(__name__)
 class HomePodSpeechRouter(FrameProcessor):
     """Route final assistant speech to the Salon HomePod with Voice PE fallback."""
 
+    _TERMINAL_PUNCTUATION = (".", "!", "?", "…")
+    _CLOSING_CHARS = '"\'»”’)]}'
+    _CONTINUATION_WORDS = {
+        "à", "au", "aux", "avec", "car", "comme", "dans", "de", "des", "du",
+        "en", "et", "lorsque", "mais", "ou", "par", "parce", "pour", "que",
+        "quand", "qui", "sans", "si", "sous", "sur", "dont",
+        "a", "an", "and", "as", "at", "because", "but", "by", "for", "from",
+        "if", "in", "of", "on", "or", "that", "the", "to", "when", "which",
+        "with", "without",
+    }
+
     def __init__(
         self,
         *,
@@ -85,24 +104,31 @@ class HomePodSpeechRouter(FrameProcessor):
         self._text_parts: list[str] = []
         self._audio_frames: list[OutputAudioRawFrame] = []
 
-        # A FunctionCallsStartedFrame can arrive just AFTER the preceding LLM end
-        # marker (SystemFrames may overtake queued data/control frames). Keep a
-        # short reply pending long enough to catch that race before speaking it.
+        # Pre-tool race guard for ordinary short complete replies.
         self._pretool_hold_seconds = self._env_float(
             "HOMEPOD_PRETOOL_HOLD_SECONDS", 1.0, minimum=0.0
         )
         self._pretool_hold_max_chars = self._env_int(
             "HOMEPOD_PRETOOL_HOLD_MAX_CHARS", 160, minimum=1
         )
+
+        # Longer, targeted guard only for text that looks unfinished. This is what
+        # prevents "Maison Cognitive est l'intelligence de" from being spoken
+        # before "la maison qui..." arrives a couple of seconds later.
+        self._continuation_hold_seconds = self._env_float(
+            "HOMEPOD_CONTINUATION_HOLD_SECONDS", 3.2, minimum=0.0
+        )
+        self._continuation_hold_max_chars = self._env_int(
+            "HOMEPOD_CONTINUATION_HOLD_MAX_CHARS", 420, minimum=1
+        )
+
         self._pending_segment: Optional[dict] = None
         self._pending_task: Optional[asyncio.Task] = None
 
         # The next LLM response after a tool call is the useful post-tool answer.
-        # It bypasses the grace window so we do not add 1 s to the final result.
         self._next_response_is_post_tool = False
 
-        # Drop a tiny PCM tail that can arrive just after an LLM end marker once
-        # the corresponding speech is being held/routed elsewhere.
+        # Drop tiny native PCM tails while text is being held/routed elsewhere.
         self._drop_audio_tail = False
 
         self._tts_chars_per_second = self._env_float(
@@ -134,6 +160,46 @@ class HomePodSpeechRouter(FrameProcessor):
             value = default
         return max(minimum, value)
 
+    @classmethod
+    def _looks_incomplete(cls, text: str) -> bool:
+        """Return True when text looks like a fragment that should be merged."""
+        clean = (text or "").strip()
+        if not clean:
+            return False
+
+        # Ignore closing quotes/brackets when checking sentence punctuation.
+        terminal_probe = clean.rstrip(cls._CLOSING_CHARS).rstrip()
+        if terminal_probe.endswith(cls._TERMINAL_PUNCTUATION):
+            return False
+
+        words = [w.strip(" ,;:!?().[]{}\"'«»”).“’").lower() for w in clean.split()]
+        words = [w for w in words if w]
+        if not words:
+            return False
+
+        if words[-1] in cls._CONTINUATION_WORDS:
+            return True
+
+        # Very short conversational answers are often complete even when the API
+        # omitted punctuation ("bonjour", "c'est fait", "21 heures 30").
+        if len(words) <= 3:
+            return False
+
+        # Longer text with no terminal punctuation is safer to treat as unfinished.
+        return True
+
+    @staticmethod
+    def _join_text(left: str, right: str) -> str:
+        left = (left or "").strip()
+        right = (right or "").strip()
+        if not left:
+            return right
+        if not right:
+            return left
+        if right[0] in ",.;:!?)]}»”’":
+            return left + right
+        return left + " " + right
+
     def _reset_current_response(self) -> None:
         self._text_parts = []
         self._audio_frames = []
@@ -155,10 +221,6 @@ class HomePodSpeechRouter(FrameProcessor):
                 "(LONGLIVED_TOKEN / SUPERVISOR_TOKEN)"
             )
 
-        # Modern Home Assistant TTS: target the configured TTS entity (which
-        # carries the Fish Audio/Morgan voice settings) and provide the media
-        # player separately. This avoids the legacy conversational script choosing
-        # a different TTS provider.
         url = f"{self._ha_api_base}/services/tts/speak"
         body = json.dumps(
             {
@@ -271,53 +333,116 @@ class HomePodSpeechRouter(FrameProcessor):
         for audio_frame in audio_frames:
             await self.push_frame(audio_frame, direction)
 
-    def _cancel_pending_as_pretool(self, reason: str) -> bool:
-        """Cancel a held short reply because a tool/follow-up response appeared."""
-        segment = self._pending_segment
-        if segment is None:
-            return False
-
+    def _stop_pending_task(self) -> None:
         task = self._pending_task
-        self._pending_segment = None
         self._pending_task = None
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
 
+    def _cancel_pending_as_pretool(self, reason: str) -> bool:
+        """Discard a held segment because a tool call has started."""
+        segment = self._pending_segment
+        if segment is None:
+            return False
+
+        self._pending_segment = None
+        self._stop_pending_task()
         logger.info(
             "⏭️ HomePod router: pré-réponse avant outil supprimée "
             f"({len(segment['text'])} caractères, {len(segment['audio'])} trames PCM; {reason})"
         )
         return True
 
-    def _schedule_short_reply(
+    def _take_pending_for_merge(self, reason: str) -> Optional[dict]:
+        """Remove and return a held segment without discarding it."""
+        segment = self._pending_segment
+        if segment is None:
+            return None
+        self._pending_segment = None
+        self._stop_pending_task()
+        logger.info(
+            "🔗 HomePod router: segment retenu fusionné avec la suite "
+            f"({len(segment['text'])} caractères; {reason})"
+        )
+        return segment
+
+    def _hold_seconds_for_text(self, text: str, *, post_tool: bool) -> float:
+        incomplete = self._looks_incomplete(text)
+        if incomplete and len(text) <= self._continuation_hold_max_chars:
+            return self._continuation_hold_seconds
+        if post_tool:
+            return 0.0
+        if len(text) <= self._pretool_hold_max_chars:
+            return self._pretool_hold_seconds
+        return 0.0
+
+    def _schedule_pending_reply(
         self,
         text: str,
         audio_frames: list[OutputAudioRawFrame],
         direction: FrameDirection,
+        *,
+        post_tool: bool,
+        hold_seconds: float,
+        reason: str,
     ) -> None:
-        """Hold a short response briefly so a racing tool call can cancel it."""
-        # There should normally be at most one pending reply. If a previous one
-        # somehow survived until a new one is scheduled, prefer the newest and
-        # suppress the older as an intermediate segment.
-        self._cancel_pending_as_pretool("nouveau segment court arrivé")
+        """Hold a response so tool-race or continuation text can be detected."""
+        # If something is already pending here, merge it rather than silently
+        # replacing it. This protects against sentence/chunk boundaries that do
+        # not come with a clean LLMFullResponseStartFrame.
+        previous = self._take_pending_for_merge("nouveau segment à mettre en attente")
+        if previous is not None:
+            text = self._join_text(previous["text"], text)
+            audio_frames = list(previous["audio"]) + list(audio_frames)
+            post_tool = bool(previous.get("post_tool")) or post_tool
+            hold_seconds = self._hold_seconds_for_text(text, post_tool=post_tool)
 
         segment = {
             "text": text,
-            "audio": audio_frames,
+            "audio": list(audio_frames),
             "direction": direction,
+            "post_tool": post_tool,
+            "hold_seconds": hold_seconds,
         }
         self._pending_segment = segment
         self._drop_audio_tail = True
-        self._pending_task = asyncio.create_task(self._deliver_pending_after_hold(segment))
+        self._pending_task = asyncio.create_task(
+            self._deliver_pending_after_hold(segment, hold_seconds)
+        )
         logger.info(
-            "⏸️ HomePod router: réponse courte retenue "
-            f"{self._pretool_hold_seconds:.1f}s pour détecter un éventuel outil "
-            f"({len(text)} caractères)"
+            "⏸️ HomePod router: réponse retenue "
+            f"{hold_seconds:.1f}s ({reason}, {len(text)} caractères)"
         )
 
-    async def _deliver_pending_after_hold(self, segment: dict) -> None:
+    def _refresh_pending_hold(self, *, reason: str) -> None:
+        segment = self._pending_segment
+        if segment is None:
+            return
+        hold_seconds = self._hold_seconds_for_text(
+            segment["text"], post_tool=bool(segment.get("post_tool"))
+        )
+        # Once text is pending, keep at least a tiny race guard even if the newly
+        # merged text became complete. For ordinary text this naturally resolves
+        # to the 1 s pre-tool guard; post-tool complete text can flush immediately.
+        segment["hold_seconds"] = hold_seconds
+        self._stop_pending_task()
+        if hold_seconds <= 0:
+            self._pending_task = asyncio.create_task(
+                self._deliver_pending_after_hold(segment, 0.0)
+            )
+        else:
+            self._pending_task = asyncio.create_task(
+                self._deliver_pending_after_hold(segment, hold_seconds)
+            )
+        logger.info(
+            "🔗 HomePod router: suite ajoutée à la réponse retenue, "
+            f"nouvelle fenêtre {hold_seconds:.1f}s ({reason}, {len(segment['text'])} caractères)"
+        )
+
+    async def _deliver_pending_after_hold(self, segment: dict, hold_seconds: float) -> None:
         try:
-            await asyncio.sleep(self._pretool_hold_seconds)
+            if hold_seconds > 0:
+                await asyncio.sleep(hold_seconds)
         except asyncio.CancelledError:
             return
 
@@ -331,8 +456,8 @@ class HomePodSpeechRouter(FrameProcessor):
         direction = segment["direction"]
 
         logger.info(
-            "▶️ HomePod router: aucun outil détecté pendant la fenêtre, "
-            "diffusion de la réponse retenue"
+            "▶️ HomePod router: fenêtre terminée, diffusion de la réponse fusionnée "
+            f"({len(text)} caractères)"
         )
         routed = await self._route_with_replying_phase(text, direction)
         if routed:
@@ -354,26 +479,37 @@ class HomePodSpeechRouter(FrameProcessor):
             return
 
         if isinstance(frame, LLMFullResponseStartFrame):
-            # A new response starting inside the grace window is another strong
-            # signal that the held reply was only an intermediate/pre-tool turn.
-            pending_cancelled = self._cancel_pending_as_pretool(
-                "nouvelle réponse LLM pendant la fenêtre"
-            )
+            # If no tool was announced, a pending segment followed by another LLM
+            # response is a continuation, not filler. Carry it into the new
+            # response so both pieces are spoken as one utterance.
+            carried = None
+            if self._pending_segment is not None:
+                if self._next_response_is_post_tool:
+                    self._cancel_pending_as_pretool(
+                        "nouvelle réponse post-outil après FunctionCallsStartedFrame"
+                    )
+                else:
+                    carried = self._take_pending_for_merge(
+                        "nouvelle réponse LLM sans outil"
+                    )
 
             self._response_active = True
             self._reset_current_response()
-            self._response_is_post_tool = (
-                self._next_response_is_post_tool or pending_cancelled
-            )
+            self._response_is_post_tool = self._next_response_is_post_tool
             self._next_response_is_post_tool = False
             self._drop_audio_tail = False
+
+            if carried is not None:
+                self._text_parts = [carried["text"]]
+                self._audio_frames = list(carried["audio"])
+                self._response_is_post_tool = (
+                    self._response_is_post_tool or bool(carried.get("post_tool"))
+                )
+
             await self.push_frame(frame, direction)
             return
 
         if isinstance(frame, FunctionCallsStartedFrame):
-            # This is the race mc3 could miss: the LLM end frame may already have
-            # been processed, leaving the short filler pending. Cancel it even if
-            # _response_active is False.
             self._cancel_pending_as_pretool("FunctionCallsStartedFrame")
             if self._response_active:
                 self._response_had_tool_call = True
@@ -384,12 +520,25 @@ class HomePodSpeechRouter(FrameProcessor):
         if isinstance(frame, (TTSTextFrame, LLMTextFrame)):
             if self._response_active and frame.text:
                 self._text_parts.append(frame.text)
+            elif self._pending_segment is not None and frame.text:
+                # Some Realtime/Pipecat sequences emit a continuation text chunk
+                # without a fresh FullResponseStartFrame. Merge it directly into
+                # the pending utterance and restart the appropriate timer.
+                segment = self._pending_segment
+                segment["text"] = self._join_text(segment["text"], frame.text)
+                self._refresh_pending_hold(reason="nouveau texte LLM")
             await self.push_frame(frame, direction)
             return
 
         if isinstance(frame, OutputAudioRawFrame):
             if self._response_active:
                 self._audio_frames.append(frame)
+                return
+
+            if self._pending_segment is not None:
+                # Keep continuation PCM too, so Voice PE fallback remains complete
+                # if Morgan/Home Assistant routing eventually fails.
+                self._pending_segment["audio"].append(frame)
                 return
 
             if self._drop_audio_tail:
@@ -439,16 +588,21 @@ class HomePodSpeechRouter(FrameProcessor):
                     )
                 return
 
-            # The final answer after a tool call should be spoken immediately.
-            # Ordinary short replies get the grace window because a tool-start
-            # SystemFrame may still be racing just behind this end marker.
-            should_hold = (
-                not is_post_tool
-                and self._pretool_hold_seconds > 0
-                and len(text) <= self._pretool_hold_max_chars
-            )
-            if should_hold:
-                self._schedule_short_reply(text, audio_frames, direction)
+            hold_seconds = self._hold_seconds_for_text(text, post_tool=is_post_tool)
+            if hold_seconds > 0:
+                reason = (
+                    "fragment incomplet / attente de continuation"
+                    if self._looks_incomplete(text)
+                    else "détection d'un éventuel outil"
+                )
+                self._schedule_pending_reply(
+                    text,
+                    audio_frames,
+                    direction,
+                    post_tool=is_post_tool,
+                    hold_seconds=hold_seconds,
+                    reason=reason,
+                )
                 return
 
             routed = await self._route_with_replying_phase(text, direction)
