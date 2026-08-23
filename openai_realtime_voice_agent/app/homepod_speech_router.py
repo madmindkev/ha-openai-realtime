@@ -18,15 +18,20 @@ Target architecture:
 
 Maison Cognitive refinements:
 
-1. Any assistant speech produced in the same response as a tool call is treated
-   as pre-tool filler and is NOT spoken. The tool result normally causes a fresh
-   assistant response; only that final answer is routed to the HomePod.
-2. Empty/duplicate LLM response-end markers are ignored quietly instead of
+1. Short assistant replies are held for a brief grace window before HomePod
+   playback. If a tool call starts during that window, the pending text/audio is
+   discarded as pre-tool filler ("je vérifie", "une seconde", etc.).
+2. The response that follows a tool call is marked as post-tool and bypasses the
+   grace window, so the useful final answer is spoken without an extra delay.
+3. Empty/duplicate LLM response-end markers are ignored quietly instead of
    producing misleading fallback warnings.
-3. ``replying`` begins BEFORE the Home Assistant service call. Some HomePod TTS
+4. ``replying`` begins BEFORE the Home Assistant service call. Some HomePod TTS
    scripts block until playback has largely/fully completed; the measured HTTP
    call duration is therefore subtracted from the estimated playback duration so
    we never wait for the same speech twice.
+
+The grace window defaults to 1.0 s for replies up to 160 characters and can be
+adjusted with HOMEPOD_PRETOOL_HOLD_SECONDS / HOMEPOD_PRETOOL_HOLD_MAX_CHARS.
 """
 
 import asyncio
@@ -36,6 +41,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from typing import Optional
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
@@ -72,11 +78,31 @@ class HomePodSpeechRouter(FrameProcessor):
         self._ha_api_base = ha_api_base.rstrip("/")
         self._timeout_seconds = float(timeout_seconds)
 
+        # Current LLM response state.
         self._response_active = False
         self._response_had_tool_call = False
+        self._response_is_post_tool = False
         self._text_parts: list[str] = []
         self._audio_frames: list[OutputAudioRawFrame] = []
 
+        # A FunctionCallsStartedFrame can arrive just AFTER the preceding LLM end
+        # marker (SystemFrames may overtake queued data/control frames). Keep a
+        # short reply pending long enough to catch that race before speaking it.
+        self._pretool_hold_seconds = self._env_float(
+            "HOMEPOD_PRETOOL_HOLD_SECONDS", 1.0, minimum=0.0
+        )
+        self._pretool_hold_max_chars = self._env_int(
+            "HOMEPOD_PRETOOL_HOLD_MAX_CHARS", 160, minimum=1
+        )
+        self._pending_segment: Optional[dict] = None
+        self._pending_task: Optional[asyncio.Task] = None
+
+        # The next LLM response after a tool call is the useful post-tool answer.
+        # It bypasses the grace window so we do not add 1 s to the final result.
+        self._next_response_is_post_tool = False
+
+        # Drop a tiny PCM tail that can arrive just after an LLM end marker once
+        # the corresponding speech is being held/routed elsewhere.
         self._drop_audio_tail = False
 
         self._tts_chars_per_second = self._env_float(
@@ -100,11 +126,19 @@ class HomePodSpeechRouter(FrameProcessor):
             value = default
         return max(minimum, value)
 
-    def _reset_response(self) -> None:
+    @staticmethod
+    def _env_int(name: str, default: int, *, minimum: int) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, value)
+
+    def _reset_current_response(self) -> None:
         self._text_parts = []
         self._audio_frames = []
         self._response_had_tool_call = False
-        self._drop_audio_tail = False
+        self._response_is_post_tool = False
 
     def _get_ha_token(self) -> str:
         return (
@@ -213,23 +247,92 @@ class HomePodSpeechRouter(FrameProcessor):
         finally:
             await self.push_frame(BotStoppedSpeakingFrame(), direction)
 
-    async def _release_voice_pe_fallback(
+    async def _release_voice_pe_fallback_frames(
         self,
+        audio_frames: list[OutputAudioRawFrame],
         direction: FrameDirection,
     ) -> None:
-        buffered_frames = self._audio_frames
-        self._audio_frames = []
-
-        if buffered_frames:
+        if audio_frames:
             logger.warning(
                 "🔊 HomePod router: diffusion de secours sur Voice PE "
-                f"({len(buffered_frames)} trames PCM)"
+                f"({len(audio_frames)} trames PCM)"
             )
         else:
             logger.debug("HomePod router: fallback sans PCM à restituer")
 
-        for audio_frame in buffered_frames:
+        for audio_frame in audio_frames:
             await self.push_frame(audio_frame, direction)
+
+    def _cancel_pending_as_pretool(self, reason: str) -> bool:
+        """Cancel a held short reply because a tool/follow-up response appeared."""
+        segment = self._pending_segment
+        if segment is None:
+            return False
+
+        task = self._pending_task
+        self._pending_segment = None
+        self._pending_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+        logger.info(
+            "⏭️ HomePod router: pré-réponse avant outil supprimée "
+            f"({len(segment['text'])} caractères, {len(segment['audio'])} trames PCM; {reason})"
+        )
+        return True
+
+    def _schedule_short_reply(
+        self,
+        text: str,
+        audio_frames: list[OutputAudioRawFrame],
+        direction: FrameDirection,
+    ) -> None:
+        """Hold a short response briefly so a racing tool call can cancel it."""
+        # There should normally be at most one pending reply. If a previous one
+        # somehow survived until a new one is scheduled, prefer the newest and
+        # suppress the older as an intermediate segment.
+        self._cancel_pending_as_pretool("nouveau segment court arrivé")
+
+        segment = {
+            "text": text,
+            "audio": audio_frames,
+            "direction": direction,
+        }
+        self._pending_segment = segment
+        self._drop_audio_tail = True
+        self._pending_task = asyncio.create_task(self._deliver_pending_after_hold(segment))
+        logger.info(
+            "⏸️ HomePod router: réponse courte retenue "
+            f"{self._pretool_hold_seconds:.1f}s pour détecter un éventuel outil "
+            f"({len(text)} caractères)"
+        )
+
+    async def _deliver_pending_after_hold(self, segment: dict) -> None:
+        try:
+            await asyncio.sleep(self._pretool_hold_seconds)
+        except asyncio.CancelledError:
+            return
+
+        if self._pending_segment is not segment:
+            return
+
+        self._pending_segment = None
+        self._pending_task = None
+        text = segment["text"]
+        audio_frames = segment["audio"]
+        direction = segment["direction"]
+
+        logger.info(
+            "▶️ HomePod router: aucun outil détecté pendant la fenêtre, "
+            "diffusion de la réponse retenue"
+        )
+        routed = await self._route_with_replying_phase(text, direction)
+        if routed:
+            self._drop_audio_tail = True
+            logger.info("🔇 HomePod router: audio Voice PE supprimé pour cette réponse")
+        else:
+            self._drop_audio_tail = False
+            await self._release_voice_pe_fallback_frames(audio_frames, direction)
 
     async def process_frame(
         self,
@@ -243,14 +346,30 @@ class HomePodSpeechRouter(FrameProcessor):
             return
 
         if isinstance(frame, LLMFullResponseStartFrame):
+            # A new response starting inside the grace window is another strong
+            # signal that the held reply was only an intermediate/pre-tool turn.
+            pending_cancelled = self._cancel_pending_as_pretool(
+                "nouvelle réponse LLM pendant la fenêtre"
+            )
+
             self._response_active = True
-            self._reset_response()
+            self._reset_current_response()
+            self._response_is_post_tool = (
+                self._next_response_is_post_tool or pending_cancelled
+            )
+            self._next_response_is_post_tool = False
+            self._drop_audio_tail = False
             await self.push_frame(frame, direction)
             return
 
         if isinstance(frame, FunctionCallsStartedFrame):
+            # This is the race mc3 could miss: the LLM end frame may already have
+            # been processed, leaving the short filler pending. Cancel it even if
+            # _response_active is False.
+            self._cancel_pending_as_pretool("FunctionCallsStartedFrame")
             if self._response_active:
                 self._response_had_tool_call = True
+            self._next_response_is_post_tool = True
             await self.push_frame(frame, direction)
             return
 
@@ -277,53 +396,60 @@ class HomePodSpeechRouter(FrameProcessor):
                 return
 
             text = "".join(self._text_parts).strip()
-            self._response_active = False
+            audio_frames = self._audio_frames
+            had_tool_call = self._response_had_tool_call
+            is_post_tool = self._response_is_post_tool
 
-            if self._response_had_tool_call:
-                discarded_chars = len(text)
-                discarded_pcm = len(self._audio_frames)
-                self._audio_frames = []
+            self._response_active = False
+            self._reset_current_response()
+
+            # Let the context aggregator close the response immediately. HomePod
+            # routing/fallback can happen after this without blocking tool frames.
+            await self.push_frame(frame, direction)
+
+            if had_tool_call:
                 self._drop_audio_tail = True
                 logger.info(
                     "⏭️ HomePod router: pré-réponse avant outil supprimée "
-                    f"({discarded_chars} caractères, {discarded_pcm} trames PCM)"
+                    f"({len(text)} caractères, {len(audio_frames)} trames PCM; "
+                    "outil détecté dans la même réponse)"
                 )
-                await self.push_frame(frame, direction)
-                self._text_parts = []
-                self._response_had_tool_call = False
                 return
 
             if not text:
-                if self._audio_frames:
+                if audio_frames:
                     logger.warning(
                         "⚠️ HomePod router: audio sans texte exploitable, "
                         "fallback Voice PE"
                     )
-                    await self._release_voice_pe_fallback(direction)
+                    self._drop_audio_tail = False
+                    await self._release_voice_pe_fallback_frames(audio_frames, direction)
                 else:
                     logger.debug(
                         "HomePod router: fin de réponse vide ignorée "
                         "(aucun texte, aucun PCM)"
                     )
-                await self.push_frame(frame, direction)
-                self._reset_response()
+                return
+
+            # The final answer after a tool call should be spoken immediately.
+            # Ordinary short replies get the grace window because a tool-start
+            # SystemFrame may still be racing just behind this end marker.
+            should_hold = (
+                not is_post_tool
+                and self._pretool_hold_seconds > 0
+                and len(text) <= self._pretool_hold_max_chars
+            )
+            if should_hold:
+                self._schedule_short_reply(text, audio_frames, direction)
                 return
 
             routed = await self._route_with_replying_phase(text, direction)
-
             if routed:
-                self._audio_frames = []
                 self._drop_audio_tail = True
-                logger.info(
-                    "🔇 HomePod router: audio Voice PE supprimé pour cette réponse"
-                )
+                logger.info("🔇 HomePod router: audio Voice PE supprimé pour cette réponse")
             else:
-                await self._release_voice_pe_fallback(direction)
                 self._drop_audio_tail = False
-
-            await self.push_frame(frame, direction)
-            self._text_parts = []
-            self._response_had_tool_call = False
+                await self._release_voice_pe_fallback_frames(audio_frames, direction)
             return
 
         await self.push_frame(frame, direction)
