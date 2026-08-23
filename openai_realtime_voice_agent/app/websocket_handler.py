@@ -501,28 +501,31 @@ class WebSocketHandler:
 
         pipeline_components.append(output_activity_tracker)
 
-        # Emit va_client phase messages (listening/thinking/replying/idle) to
-        # the device, derived from Pipecat speaking frames as they pass
-        # downstream. Placed before transport.output() so it sees both the
-        # user (UserStarted/Stopped) and bot (BotStarted/Stopped) frames.
-        # (Constructed above, before ConnectionRecovery.)
-        pipeline_components.append(phase_emitter)
-
-        # Add output audio recorder to capture ONLY OutputAudioRawFrame
+        # Add output audio recorder to capture ONLY OutputAudioRawFrame. Keep it
+        # before the HomePod router so optional diagnostics still capture the
+        # native OpenAI PCM even when that PCM is not played by the Voice PE.
         output_recorder = self.audio_recording_service.get_output_recorder() if self.audio_recording_service else None
         if output_recorder:
             pipeline_components.append(output_recorder)
 
-        # Maison Cognitive:
-        # - Voice PE Cuisine = micro / wake word / LED / contrôle de session
-        # - HomePod Salon = sortie conversationnelle
+        # Maison Cognitive conversational audio routing.
         #
-        # Le routeur collecte le texte réellement prononcé par OpenAI et retient
-        # temporairement le PCM qui partirait normalement vers le haut-parleur
-        # du Voice PE. Si Home Assistant accepte la diffusion sur le HomePod,
-        # le PCM PE est supprimé. Si la diffusion HomePod échoue, le PCM est
-        # relâché vers le Voice PE comme solution de secours.
+        # IMPORTANT ORDER: router BEFORE PhaseEmitter. On successful HomePod TTS
+        # the router suppresses native PCM and emits synthetic
+        # BotStartedSpeakingFrame/BotStoppedSpeakingFrame around the estimated
+        # HomePod playback interval. PhaseEmitter sees those standard frames and
+        # therefore keeps the Voice PE LED, mic gate and follow-up lifecycle
+        # coherent without any special-case code. If HomePod routing fails, the
+        # router releases the original PCM; transport.output() then generates its
+        # normal real BotStarted/Stopped frames upstream, which PhaseEmitter also
+        # sees.
         pipeline_components.append(HomePodSpeechRouter())
+
+        # Emit va_client phase messages (listening/thinking/replying/idle) to the
+        # device. It now sees either the router's synthetic HomePod speaking
+        # frames or the output transport's native fallback speaking frames.
+        # (Constructed above, before ConnectionRecovery.)
+        pipeline_components.append(phase_emitter)
 
         pipeline_components.append(transport.output())
         
