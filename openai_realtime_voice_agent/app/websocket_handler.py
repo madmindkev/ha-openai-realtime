@@ -484,25 +484,34 @@ class WebSocketHandler:
         # aggregator can consume it) — opposite directions, so they need taps on
         # opposite sides of the service (see transcript_logger.py): "user" before
         # the LLM, "assistant" after it.
+        # IMPORTANT — Pipecat 0.0.97:
+        # LLMAssistantAggregator CONSUMES LLMFullResponseStartFrame,
+        # LLMFullResponseEndFrame and TextFrame/TTSTextFrame instead of forwarding
+        # them downstream. The HomePod router MUST therefore sit BEFORE
+        # context_aggregator.assistant(); otherwise it sees only unbracketed PCM,
+        # considers no response active, and lets that PCM go straight to Voice PE.
+        #
+        # Keep activity tracking / optional recording before the router so native
+        # OpenAI PCM is still visible for diagnostics even when it is suppressed
+        # before reaching the Voice PE.
         if context_aggregator:
             pipeline_components.extend([
                 context_aggregator.user(),
                 TranscriptLogger(capture="user"),
                 openai_service,
                 TranscriptLogger(capture="assistant"),
-                context_aggregator.assistant(),
+                output_activity_tracker,
             ])
         else:
             pipeline_components.extend([
                 TranscriptLogger(capture="user"),
                 openai_service,
                 TranscriptLogger(capture="assistant"),
+                output_activity_tracker,
             ])
 
-        pipeline_components.append(output_activity_tracker)
-
         # Add output audio recorder to capture ONLY OutputAudioRawFrame. Keep it
-        # before the HomePod router so optional diagnostics still capture the
+        # BEFORE the HomePod router so optional diagnostics still capture the
         # native OpenAI PCM even when that PCM is not played by the Voice PE.
         output_recorder = self.audio_recording_service.get_output_recorder() if self.audio_recording_service else None
         if output_recorder:
@@ -510,20 +519,25 @@ class WebSocketHandler:
 
         # Maison Cognitive conversational audio routing.
         #
-        # IMPORTANT ORDER: router BEFORE PhaseEmitter. On successful HomePod TTS
-        # the router suppresses native PCM and emits synthetic
-        # BotStartedSpeakingFrame/BotStoppedSpeakingFrame around the estimated
-        # HomePod playback interval. PhaseEmitter sees those standard frames and
-        # therefore keeps the Voice PE LED, mic gate and follow-up lifecycle
-        # coherent without any special-case code. If HomePod routing fails, the
-        # router releases the original PCM; transport.output() then generates its
-        # normal real BotStarted/Stopped frames upstream, which PhaseEmitter also
-        # sees.
+        # CRITICAL ORDER:
+        # OpenAI -> assistant transcript logger -> activity/recorder ->
+        # HomePodSpeechRouter -> assistant context aggregator -> PhaseEmitter ->
+        # transport.output().
+        #
+        # The router now receives the response start/end markers, TTSTextFrame
+        # transcript chunks and PCM. On successful HomePod TTS it suppresses the
+        # native PCM and emits synthetic BotStartedSpeakingFrame /
+        # BotStoppedSpeakingFrame. The assistant aggregator still receives the
+        # original text/boundary frames (the router forwards them) and therefore
+        # keeps conversation context correct.
         pipeline_components.append(HomePodSpeechRouter())
 
+        if context_aggregator:
+            pipeline_components.append(context_aggregator.assistant())
+
         # Emit va_client phase messages (listening/thinking/replying/idle) to the
-        # device. It now sees either the router's synthetic HomePod speaking
-        # frames or the output transport's native fallback speaking frames.
+        # device. It sees either the router's synthetic HomePod speaking frames
+        # or the output transport's native fallback speaking frames.
         # (Constructed above, before ConnectionRecovery.)
         pipeline_components.append(phase_emitter)
 
