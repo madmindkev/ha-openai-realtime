@@ -8,8 +8,8 @@ Target architecture:
 - Voice PE Cuisine = microphone / wake word / LED / session control.
 - HomePod Salon = conversational loudspeaker.
 - OpenAI Realtime keeps generating audio normally.
-- The spoken transcript is sent automatically to Home Assistant via
-  ``script.mc_reponse_homepod``.
+- Conversational speech is rendered by the dedicated Maison Cognitive Morgan
+  TTS entity and played on the Salon HomePod through Home Assistant ``tts.speak``.
 - Native OpenAI PCM is held as a fail-safe instead of being played immediately
   by the Voice PE.
 - If Home Assistant accepts the HomePod TTS request, the held PCM is discarded.
@@ -25,8 +25,8 @@ Maison Cognitive refinements:
    grace window, so the useful final answer is spoken without an extra delay.
 3. Empty/duplicate LLM response-end markers are ignored quietly instead of
    producing misleading fallback warnings.
-4. ``replying`` begins BEFORE the Home Assistant service call. Some HomePod TTS
-   scripts block until playback has largely/fully completed; the measured HTTP
+4. ``replying`` begins BEFORE the Home Assistant TTS call. Some TTS/media-player
+   stacks block until playback has largely/fully completed; the measured HTTP
    call duration is therefore subtracted from the estimated playback duration so
    we never wait for the same speech twice.
 
@@ -66,7 +66,7 @@ class HomePodSpeechRouter(FrameProcessor):
         self,
         *,
         target_entity: str = "media_player.salon_salon_homepod",
-        script_service: str = "mc_reponse_homepod",
+        tts_entity: str = "tts.maison_cognitive_morgan_maison_cognitive_morgan",
         ha_api_base: str = "http://supervisor/core/api",
         timeout_seconds: float = 30.0,
         **kwargs,
@@ -74,7 +74,7 @@ class HomePodSpeechRouter(FrameProcessor):
         super().__init__(**kwargs)
 
         self._target_entity = target_entity
-        self._script_service = script_service
+        self._tts_entity = tts_entity
         self._ha_api_base = ha_api_base.rstrip("/")
         self._timeout_seconds = float(timeout_seconds)
 
@@ -147,6 +147,7 @@ class HomePodSpeechRouter(FrameProcessor):
         )
 
     def _call_home_assistant_sync(self, text: str) -> None:
+        """Render speech with Maison Cognitive Morgan and play it on the HomePod."""
         token = self._get_ha_token()
         if not token:
             raise RuntimeError(
@@ -154,11 +155,17 @@ class HomePodSpeechRouter(FrameProcessor):
                 "(LONGLIVED_TOKEN / SUPERVISOR_TOKEN)"
             )
 
-        url = f"{self._ha_api_base}/services/script/{self._script_service}"
+        # Modern Home Assistant TTS: target the configured TTS entity (which
+        # carries the Fish Audio/Morgan voice settings) and provide the media
+        # player separately. This avoids the legacy conversational script choosing
+        # a different TTS provider.
+        url = f"{self._ha_api_base}/services/tts/speak"
         body = json.dumps(
             {
-                "target": self._target_entity,
+                "entity_id": self._tts_entity,
+                "media_player_entity_id": self._target_entity,
                 "message": text,
+                "cache": False,
             }
         ).encode("utf-8")
 
@@ -194,14 +201,15 @@ class HomePodSpeechRouter(FrameProcessor):
             await asyncio.to_thread(self._call_home_assistant_sync, text)
             elapsed = time.monotonic() - started
             logger.info(
-                "🏠 HomePod router: segment accepté par Home Assistant "
-                f"vers {self._target_entity} ({len(text)} caractères, appel {elapsed:.1f}s)"
+                "🏠 HomePod router: Morgan TTS accepté par Home Assistant "
+                f"via {self._tts_entity} vers {self._target_entity} "
+                f"({len(text)} caractères, appel {elapsed:.1f}s)"
             )
             return True, elapsed
         except Exception as exc:
             elapsed = time.monotonic() - started
             logger.warning(
-                "⚠️ HomePod router: échec du routage, "
+                "⚠️ HomePod router: échec Morgan TTS, "
                 f"fallback Voice PE activé après {elapsed:.1f}s: {exc!r}"
             )
             return False, elapsed
