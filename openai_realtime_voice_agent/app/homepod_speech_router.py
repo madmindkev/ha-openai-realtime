@@ -1,4 +1,4 @@
-"""Route every assistant spoken segment to the Salon HomePod.
+"""Route assistant speech to the Salon HomePod.
 
 MAISON COGNITIVE
 =================
@@ -16,22 +16,24 @@ Target architecture:
 - If HomePod routing fails, the held PCM is released to the Voice PE so the user
   is never left with silence.
 
-The router also mirrors a successful HomePod playback into Pipecat's normal bot
-speaking lifecycle with ``BotStartedSpeakingFrame`` / ``BotStoppedSpeakingFrame``.
-The pipeline places this router BEFORE ``PhaseEmitter`` so the Voice PE still
-receives ``replying`` / ``idle`` phases even though no native PCM reaches its
-speaker.
+Maison Cognitive refinements:
 
-Home Assistant's REST service call returns when TTS has been accepted, not when
-the HomePod has physically finished speaking. We therefore keep the synthetic
-``replying`` phase active for a conservative text-duration estimate. The timing
-can be tuned with environment variables without changing code.
+1. Any assistant speech produced in the same response as a tool call is treated
+   as pre-tool filler and is NOT spoken. The tool result normally causes a fresh
+   assistant response; only that final answer is routed to the HomePod.
+2. Empty/duplicate LLM response-end markers are ignored quietly instead of
+   producing misleading fallback warnings.
+3. ``replying`` begins BEFORE the Home Assistant service call. Some HomePod TTS
+   scripts block until playback has largely/fully completed; the measured HTTP
+   call duration is therefore subtracted from the estimated playback duration so
+   we never wait for the same speech twice.
 """
 
 import asyncio
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -39,6 +41,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallsStartedFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
@@ -51,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 
 class HomePodSpeechRouter(FrameProcessor):
-    """Route assistant speech to the Salon HomePod with Voice PE fallback."""
+    """Route final assistant speech to the Salon HomePod with Voice PE fallback."""
 
     def __init__(
         self,
@@ -70,17 +73,12 @@ class HomePodSpeechRouter(FrameProcessor):
         self._timeout_seconds = float(timeout_seconds)
 
         self._response_active = False
+        self._response_had_tool_call = False
         self._text_parts: list[str] = []
         self._audio_frames: list[OutputAudioRawFrame] = []
 
-        # A very small PCM tail can arrive after LLMFullResponseEndFrame on some
-        # versions/stacks. Once HomePod routing succeeds, keep dropping that tail
-        # until the next LLMFullResponseStartFrame resets the response state.
         self._drop_audio_tail = False
 
-        # Home Assistant returns before physical TTS playback completes. Keep the
-        # Voice PE in `replying` for an estimated audible duration so its mic and
-        # follow-up window do not reopen while the HomePod is still talking.
         self._tts_chars_per_second = self._env_float(
             "HOMEPOD_TTS_CHARS_PER_SECOND", 15.0, minimum=5.0
         )
@@ -105,17 +103,16 @@ class HomePodSpeechRouter(FrameProcessor):
     def _reset_response(self) -> None:
         self._text_parts = []
         self._audio_frames = []
+        self._response_had_tool_call = False
         self._drop_audio_tail = False
 
     def _get_ha_token(self) -> str:
-        """Return the HA token available inside the add-on."""
         return (
             os.environ.get("LONGLIVED_TOKEN", "").strip()
             or os.environ.get("SUPERVISOR_TOKEN", "").strip()
         )
 
     def _call_home_assistant_sync(self, text: str) -> None:
-        """Call script.mc_reponse_homepod through the Supervisor HA proxy."""
         token = self._get_ha_token()
         if not token:
             raise RuntimeError(
@@ -157,30 +154,25 @@ class HomePodSpeechRouter(FrameProcessor):
                 f"Home Assistant inaccessible: {exc.reason}"
             ) from exc
 
-    async def _speak_on_homepod(self, text: str) -> bool:
-        """Ask Home Assistant to start TTS on the HomePod."""
+    async def _speak_on_homepod(self, text: str) -> tuple[bool, float]:
+        started = time.monotonic()
         try:
             await asyncio.to_thread(self._call_home_assistant_sync, text)
+            elapsed = time.monotonic() - started
             logger.info(
                 "🏠 HomePod router: segment accepté par Home Assistant "
-                f"vers {self._target_entity} ({len(text)} caractères)"
+                f"vers {self._target_entity} ({len(text)} caractères, appel {elapsed:.1f}s)"
             )
-            return True
+            return True, elapsed
         except Exception as exc:
+            elapsed = time.monotonic() - started
             logger.warning(
                 "⚠️ HomePod router: échec du routage, "
-                f"fallback Voice PE activé: {exc!r}"
+                f"fallback Voice PE activé après {elapsed:.1f}s: {exc!r}"
             )
-            return False
+            return False, elapsed
 
     def _estimate_playback_seconds(self, text: str) -> float:
-        """Estimate HomePod TTS duration conservatively.
-
-        Google Translate / ordinary conversational French is roughly around
-        14-16 characters per second including spaces. Add startup latency plus
-        small punctuation pauses, then clamp the result so a malformed/huge
-        response cannot lock the Voice PE in replying indefinitely.
-        """
         punctuation_pause = sum(text.count(ch) for ch in ".!?;:") * 0.08
         estimated = (
             self._tts_startup_seconds
@@ -192,26 +184,32 @@ class HomePodSpeechRouter(FrameProcessor):
             max(self._tts_min_seconds, estimated),
         )
 
-    async def _mirror_homepod_playback(
+    async def _route_with_replying_phase(
         self,
         text: str,
         direction: FrameDirection,
-    ) -> None:
-        """Drive the existing PhaseEmitter with normal bot-speaking frames.
-
-        The pipeline deliberately places this router before PhaseEmitter. These
-        synthetic system frames therefore trigger the exact same replying/idle
-        logic as native Voice PE playback, without touching PhaseEmitter itself.
-        """
-        duration = self._estimate_playback_seconds(text)
-        logger.info(
-            "🗣️ HomePod router: phase replying estimée "
-            f"pendant {duration:.1f}s"
-        )
-
+    ) -> bool:
+        estimated = self._estimate_playback_seconds(text)
         await self.push_frame(BotStartedSpeakingFrame(), direction)
         try:
-            await asyncio.sleep(duration)
+            routed, call_elapsed = await self._speak_on_homepod(text)
+            if not routed:
+                return False
+
+            remaining = max(0.0, estimated - call_elapsed)
+            if remaining > 0.05:
+                logger.info(
+                    "🗣️ HomePod router: phase replying, "
+                    f"appel HA {call_elapsed:.1f}s + reliquat estimé {remaining:.1f}s"
+                )
+                await asyncio.sleep(remaining)
+            else:
+                logger.info(
+                    "🗣️ HomePod router: appel HA a déjà couvert la lecture "
+                    f"({call_elapsed:.1f}s >= estimation {estimated:.1f}s), "
+                    "aucune attente supplémentaire"
+                )
+            return True
         finally:
             await self.push_frame(BotStoppedSpeakingFrame(), direction)
 
@@ -219,14 +217,16 @@ class HomePodSpeechRouter(FrameProcessor):
         self,
         direction: FrameDirection,
     ) -> None:
-        """Release held native PCM to the Voice PE after routing failure."""
         buffered_frames = self._audio_frames
         self._audio_frames = []
 
-        logger.warning(
-            "🔊 HomePod router: diffusion de secours sur Voice PE "
-            f"({len(buffered_frames)} trames PCM)"
-        )
+        if buffered_frames:
+            logger.warning(
+                "🔊 HomePod router: diffusion de secours sur Voice PE "
+                f"({len(buffered_frames)} trames PCM)"
+            )
+        else:
+            logger.debug("HomePod router: fallback sans PCM à restituer")
 
         for audio_frame in buffered_frames:
             await self.push_frame(audio_frame, direction)
@@ -238,8 +238,6 @@ class HomePodSpeechRouter(FrameProcessor):
     ):
         await super().process_frame(frame, direction)
 
-        # Only alter the assistant's downstream output. Upstream transport
-        # speaking frames (used by native fallback) must pass unchanged.
         if direction != FrameDirection.DOWNSTREAM:
             await self.push_frame(frame, direction)
             return
@@ -247,6 +245,12 @@ class HomePodSpeechRouter(FrameProcessor):
         if isinstance(frame, LLMFullResponseStartFrame):
             self._response_active = True
             self._reset_response()
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, FunctionCallsStartedFrame):
+            if self._response_active:
+                self._response_had_tool_call = True
             await self.push_frame(frame, direction)
             return
 
@@ -258,55 +262,68 @@ class HomePodSpeechRouter(FrameProcessor):
 
         if isinstance(frame, OutputAudioRawFrame):
             if self._response_active:
-                # Hold native Realtime PCM as a fail-safe until HomePod routing
-                # success/failure is known at the response end.
                 self._audio_frames.append(frame)
                 return
 
             if self._drop_audio_tail:
                 return
 
-            # Unknown/unbracketed audio: preserve the original behavior rather
-            # than risking silent loss.
             await self.push_frame(frame, direction)
             return
 
         if isinstance(frame, LLMFullResponseEndFrame):
+            if not self._response_active:
+                await self.push_frame(frame, direction)
+                return
+
             text = "".join(self._text_parts).strip()
             self._response_active = False
 
-            if not text:
-                logger.warning(
-                    "⚠️ HomePod router: réponse sans texte exploitable, "
-                    "fallback Voice PE"
+            if self._response_had_tool_call:
+                discarded_chars = len(text)
+                discarded_pcm = len(self._audio_frames)
+                self._audio_frames = []
+                self._drop_audio_tail = True
+                logger.info(
+                    "⏭️ HomePod router: pré-réponse avant outil supprimée "
+                    f"({discarded_chars} caractères, {discarded_pcm} trames PCM)"
                 )
-                await self._release_voice_pe_fallback(direction)
+                await self.push_frame(frame, direction)
+                self._text_parts = []
+                self._response_had_tool_call = False
+                return
+
+            if not text:
+                if self._audio_frames:
+                    logger.warning(
+                        "⚠️ HomePod router: audio sans texte exploitable, "
+                        "fallback Voice PE"
+                    )
+                    await self._release_voice_pe_fallback(direction)
+                else:
+                    logger.debug(
+                        "HomePod router: fin de réponse vide ignorée "
+                        "(aucun texte, aucun PCM)"
+                    )
                 await self.push_frame(frame, direction)
                 self._reset_response()
                 return
 
-            routed = await self._speak_on_homepod(text)
+            routed = await self._route_with_replying_phase(text, direction)
 
             if routed:
-                # Home Assistant accepted TTS. Suppress native PE audio and mirror
-                # the audible HomePod interval into the standard speaking frames
-                # so PhaseEmitter keeps LED/mic/follow-up state coherent.
                 self._audio_frames = []
                 self._drop_audio_tail = True
                 logger.info(
-                    "🔇 HomePod router: audio Voice PE supprimé "
-                    "pour cette réponse"
+                    "🔇 HomePod router: audio Voice PE supprimé pour cette réponse"
                 )
-                await self._mirror_homepod_playback(text, direction)
             else:
-                # HA/HomePod routing failed before acceptance: release native PCM.
-                # The real output transport will then generate its own
-                # BotStarted/Stopped frames, exactly as before this router existed.
                 await self._release_voice_pe_fallback(direction)
                 self._drop_audio_tail = False
 
             await self.push_frame(frame, direction)
             self._text_parts = []
+            self._response_had_tool_call = False
             return
 
         await self.push_frame(frame, direction)
