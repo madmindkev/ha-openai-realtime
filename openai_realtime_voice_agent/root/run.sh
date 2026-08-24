@@ -127,7 +127,8 @@ fi
 # SUPERVISOR_TOKEN is automatically provided by Home Assistant when homeassistant_api: true
 
 # Start the application.
-# mc10 imports the validated mc9 baseline, then installs the stronger tool-filler
-# guard plus RAOP startup instrumentation before main constructs the pipeline.
+# mc11 imports the validated mc10/mc9 baseline, then applies the conservative
+# semantic-VAD latency trial and end-to-end timing instrumentation before main
+# constructs the OpenAI session and pipeline.
 export PYTHONUNBUFFERED=1
-exec python3 -c 'import app.mc10_patch; import runpy; runpy.run_module("app.main", run_name="__main__")'
+exec python3 -c 'import app.mc11_patch; import runpy; runpy.run_module("app.main", run_name="__main__")'
