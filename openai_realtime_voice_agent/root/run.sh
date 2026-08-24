@@ -127,8 +127,7 @@ fi
 # SUPERVISOR_TOKEN is automatically provided by Home Assistant when homeassistant_api: true
 
 # Start the application.
-# mc9 is imported EXPLICITLY here (unlike the mc7 sitecustomize experiment), so
-# the latency/follow-up refinements are guaranteed to be installed before main
-# constructs HomePodSpeechRouter / PhaseEmitter instances.
+# mc10 imports the validated mc9 baseline, then installs the stronger tool-filler
+# guard plus RAOP startup instrumentation before main constructs the pipeline.
 export PYTHONUNBUFFERED=1
-exec python3 -c 'import app.mc9_patch; import runpy; runpy.run_module("app.main", run_name="__main__")'
+exec python3 -c 'import app.mc10_patch; import runpy; runpy.run_module("app.main", run_name="__main__")'
