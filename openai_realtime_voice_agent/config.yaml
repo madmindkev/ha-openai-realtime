@@ -1,5 +1,5 @@
 name: OpenAI Realtime 2 Voice Agent
-version: "0.6.1-mc10"
+version: "0.6.1-mc11"
 slug: openai_realtime_voice_agent
 description: Talk to your home with OpenAI gpt-realtime-2 — a voice agent for the Home Assistant Voice PE, with live device control and web search.
 url: https://github.com/madmindkev/ha-openai-realtime
@@ -80,7 +80,7 @@ options:
   # an unprompted answer). Was a hardcoded 400 ms in the firmware yaml; now sent
   # in `hello` so it's tunable like follow_up_open_delay_ms.
   wake_open_delay_ms: 700
-  vad_eagerness: "low"
+  vad_eagerness: "medium"
   phase_idle_debounce_ms: 1500
 
   # --- 🌐 Web search ---
