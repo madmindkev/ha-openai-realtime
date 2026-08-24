@@ -127,8 +127,8 @@ fi
 # SUPERVISOR_TOKEN is automatically provided by Home Assistant when homeassistant_api: true
 
 # Start the application.
-# mc11 imports the validated mc10/mc9 baseline, then applies the conservative
-# semantic-VAD latency trial and end-to-end timing instrumentation before main
-# constructs the OpenAI session and pipeline.
+# mc12 imports the complete validated mc11->mc10->mc9 stack, then adds the
+# generic 750 ms pre-tool race guard and the Maison Cognitive continuity/context
+# prompt appendix before main constructs the OpenAI session and pipeline.
 export PYTHONUNBUFFERED=1
-exec python3 -c 'import app.mc11_patch; import runpy; runpy.run_module("app.main", run_name="__main__")'
+exec python3 -c 'import app.mc12_patch; import runpy; runpy.run_module("app.main", run_name="__main__")'
