@@ -228,16 +228,27 @@ class HomePodSpeechRouter(FrameProcessor):
                 "Content-Type": "application/json",
             },
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
-                status = response.getcode()
-                payload = response.read()
-                if status < 200 or status >= 300:
-                    raise RuntimeError(f"Home Assistant HTTP {status}")
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Home Assistant HTTP {exc.code}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Home Assistant inaccessible: {exc.reason}") from exc
+        last_error = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                    status = response.getcode()
+                    payload = response.read()
+                    if status < 200 or status >= 300:
+                        raise RuntimeError(f"Home Assistant HTTP {status}")
+                    break
+            except urllib.error.HTTPError as exc:
+                last_error = RuntimeError(f"Home Assistant HTTP {exc.code}")
+                if exc.code != 502 or attempt == 2:
+                    raise last_error from exc
+                time.sleep(0.35 * (attempt + 1))
+            except urllib.error.URLError as exc:
+                last_error = RuntimeError(f"Home Assistant inaccessible: {exc.reason}")
+                if attempt == 2:
+                    raise last_error from exc
+                time.sleep(0.35 * (attempt + 1))
+        else:
+            raise last_error or RuntimeError("Home Assistant request failed")
 
         if not payload:
             return {}
@@ -265,16 +276,26 @@ class HomePodSpeechRouter(FrameProcessor):
                 "Content-Type": "application/json",
             },
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
-                status = response.getcode()
-                if status < 200 or status >= 300:
-                    raise RuntimeError(f"Home Assistant HTTP {status}")
-                response.read()
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Home Assistant HTTP {exc.code}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Home Assistant inaccessible: {exc.reason}") from exc
+        last_error = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                    status = response.getcode()
+                    if status < 200 or status >= 300:
+                        raise RuntimeError(f"Home Assistant HTTP {status}")
+                    response.read()
+                    return
+            except urllib.error.HTTPError as exc:
+                last_error = RuntimeError(f"Home Assistant HTTP {exc.code}")
+                if exc.code != 502 or attempt == 2:
+                    raise last_error from exc
+                time.sleep(0.35 * (attempt + 1))
+            except urllib.error.URLError as exc:
+                last_error = RuntimeError(f"Home Assistant inaccessible: {exc.reason}")
+                if attempt == 2:
+                    raise last_error from exc
+                time.sleep(0.35 * (attempt + 1))
+        raise last_error or RuntimeError("Home Assistant request failed")
 
     def _call_home_assistant_fast_sync(self, text: str) -> tuple[float, float]:
         """Create a lazy Morgan stream URL, then start it on the Salon HomePod."""
