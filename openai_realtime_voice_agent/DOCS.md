@@ -72,7 +72,7 @@ option has plain-language inline help.
 | `openai_voice` | `marin` | `marin`/`cedar` are the newest voices |
 | `transcription_language` | *(blank)* | set your ISO code (e.g. `nl`): locks the language + logs the user transcript |
 | `instructions` | *(English default)* | the system prompt; swap the LANGUAGE line for your language |
-| `follow_up_listen_seconds` | `8` | mic stays open this long so you can answer back |
+| `follow_up_listen_seconds` | `4` | mic stays open this long so you can answer back; shorter values reduce post-response false wakes |
 | `follow_up_open_delay_ms` | `700` | echo guard before the follow-up mic opens; lower = snappier but risks ghost turns |
 | `wake_open_delay_ms` | `700` | the same echo guard right after the wake chime; lower = snappier wake but risks a ghost turn |
 | `vad_eagerness` | `low` | waits longest before deciding you're done talking |

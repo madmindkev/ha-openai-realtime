@@ -35,7 +35,8 @@ options:
   openai_speed: 1.0
   max_output_tokens: 0
 
-  follow_up_listen_seconds: 8
+  # Short follow-up window limits accidental post-response wake-ups.
+  follow_up_listen_seconds: 4
   follow_up_open_delay_ms: 700
   wake_open_delay_ms: 700
   vad_eagerness: "medium"
