@@ -88,6 +88,7 @@ class HomePodSpeechRouter(FrameProcessor):
     def __init__(
         self,
         *,
+        route_policy: str = "all",
         target_entity: str = "media_player.salon_salon_homepod",
         tts_entity: str = "tts.maison_cognitive_morgan_maison_cognitive_morgan",
         ha_api_base: str = "http://supervisor/core/api",
@@ -96,6 +97,13 @@ class HomePodSpeechRouter(FrameProcessor):
     ):
         super().__init__(**kwargs)
 
+        self._route_policy = (route_policy or "all").strip().lower()
+        if self._route_policy not in {"all", "post_tool_only"}:
+            logger.warning(
+                "⚠️ HomePod router: politique inconnue %r, utilisation de all",
+                route_policy,
+            )
+            self._route_policy = "all"
         self._target_entity = target_entity
         self._tts_entity = tts_entity
         self._ha_api_base = ha_api_base.rstrip("/")
@@ -487,6 +495,12 @@ class HomePodSpeechRouter(FrameProcessor):
             return self._pretool_hold_seconds
         return 0.0
 
+    def _should_route_response(self, *, post_tool: bool) -> bool:
+        """Return whether this completed response should use HomePod TTS."""
+        return self._route_policy == "all" or (
+            self._route_policy == "post_tool_only" and post_tool
+        )
+
     def _schedule_pending_reply(
         self,
         text: str,
@@ -681,6 +695,16 @@ class HomePodSpeechRouter(FrameProcessor):
                         "HomePod router: fin de réponse vide ignorée "
                         "(aucun texte, aucun PCM)"
                     )
+                return
+
+            if not self._should_route_response(post_tool=is_post_tool):
+                self._drop_audio_tail = False
+                await self._release_voice_pe_fallback_frames(audio_frames, direction)
+                logger.info(
+                    "🔈 HomePod router: réponse conservée sur Voice PE "
+                    "(politique %s)",
+                    self._route_policy,
+                )
                 return
 
             hold_seconds = self._hold_seconds_for_text(text, post_tool=is_post_tool)

@@ -536,6 +536,7 @@ class WebSocketHandler:
         }:
             pipeline_components.append(
                 HomePodSpeechRouter(
+                    route_policy=os.environ.get("HOMEPOD_ROUTE_POLICY", "all"),
                     target_entity=os.environ.get(
                         "HOMEPOD_TARGET_ENTITY",
                         "media_player.salon_salon_homepod",

@@ -48,6 +48,7 @@ options:
   noise_reduction: "off"
 
   homepod_routing_enabled: true
+  homepod_route_policy: "all"
   homepod_target_entity: "media_player.salon_salon_homepod"
   homepod_tts_entity: "tts.maison_cognitive_morgan_maison_cognitive_morgan"
   homepod_timeout_seconds: 30.0
@@ -92,6 +93,7 @@ schema:
   playback_prebuffer_ms: int(0,2000)
   noise_reduction: "list(off|near_field|far_field)"
   homepod_routing_enabled: bool
+  homepod_route_policy: "list(all|post_tool_only)"
   homepod_target_entity: str
   homepod_tts_entity: str
   homepod_timeout_seconds: float(1,120)

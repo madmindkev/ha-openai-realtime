@@ -27,6 +27,7 @@ WEB_SEARCH_MODEL=$(bashio::config 'web_search_model')
 PLAYBACK_PREBUFFER_MS=$(bashio::config 'playback_prebuffer_ms')
 NOISE_REDUCTION=$(bashio::config 'noise_reduction')
 HOMEPOD_ROUTING_ENABLED=$(bashio::config 'homepod_routing_enabled')
+HOMEPOD_ROUTE_POLICY=$(bashio::config 'homepod_route_policy')
 HOMEPOD_TARGET_ENTITY=$(bashio::config 'homepod_target_entity')
 HOMEPOD_TTS_ENTITY=$(bashio::config 'homepod_tts_entity')
 HOMEPOD_TIMEOUT_SECONDS=$(bashio::config 'homepod_timeout_seconds')
@@ -77,6 +78,7 @@ export WEB_SEARCH_MODEL
 export PLAYBACK_PREBUFFER_MS
 export NOISE_REDUCTION
 export HOMEPOD_ROUTING_ENABLED
+export HOMEPOD_ROUTE_POLICY
 export HOMEPOD_TARGET_ENTITY
 export HOMEPOD_TTS_ENTITY
 export HOMEPOD_TIMEOUT_SECONDS
