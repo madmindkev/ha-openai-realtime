@@ -55,7 +55,6 @@ options:
   homepod_timeout_seconds: 30.0
   homepod_pretool_hold_seconds: 0.75
   homepod_tool_filler_hold_seconds: 1.5
-  homepod_complete_hold_seconds: 0.35
   homepod_pretool_hold_max_chars: 160
   homepod_continuation_hold_seconds: 2.0
   homepod_continuation_hold_max_chars: 420
@@ -103,7 +102,6 @@ schema:
   homepod_timeout_seconds: float(1,120)
   homepod_pretool_hold_seconds: float(0,30)
   homepod_tool_filler_hold_seconds: float(0,30)
-  homepod_complete_hold_seconds: float(0,30)
   homepod_pretool_hold_max_chars: int(1,2000)
   homepod_continuation_hold_seconds: float(0,30)
   homepod_continuation_hold_max_chars: int(1,5000)

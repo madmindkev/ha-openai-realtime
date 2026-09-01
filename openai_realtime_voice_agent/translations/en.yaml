@@ -170,10 +170,6 @@ configuration:
     name: "🍎 HomePod · Tool-filler hold (s)"
     description: >-
       Grace period for known filler phrases immediately before a tool call.
-  homepod_complete_hold_seconds:
-    name: "🍎 HomePod · Complete reply hold (s)"
-    description: >-
-      Short hold for complete non-tool replies; zero sends them immediately.
 
   # --- 🏠 Home Assistant ---
   ha_mcp_url:

@@ -73,9 +73,7 @@ def _mc9_router_init(self, *args, **kwargs):
     self._continuation_hold_seconds = self._env_float(
         "HOMEPOD_CONTINUATION_HOLD_SECONDS", 2.0, minimum=0.0
     )
-    self._mc9_complete_hold_seconds = self._env_float(
-        "HOMEPOD_COMPLETE_HOLD_SECONDS", 0.35, minimum=0.0
-    )
+    self._mc9_complete_hold_seconds = 0.35
     self._mc9_tool_filler_hold_seconds = self._env_float(
         "HOMEPOD_TOOL_FILLER_HOLD_SECONDS", 1.5, minimum=0.0
     )

@@ -61,11 +61,10 @@ def _mc12_router_init(self, *args, **kwargs):
     )
     logger.info(
         "🍎 HomePod hold policy effective: generic_pretool=%.2fs "
-        "tool_filler=%.2fs continuation=%.2fs complete=%.2fs",
+        "tool_filler=%.2fs continuation=%.2fs",
         self._mc12_generic_pretool_hold_seconds,
         self._mc10_tool_filler_hold_seconds,
         self._continuation_hold_seconds,
-        self._mc9_complete_hold_seconds,
     )
 
 
