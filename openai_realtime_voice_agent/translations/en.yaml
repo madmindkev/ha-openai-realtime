@@ -142,6 +142,25 @@ configuration:
       usually fine — the device already filters. Try "near_field" if you
       talk close to the device, "far_field" for across the room, when it
       mishears you in a noisy environment.
+  homepod_routing_enabled:
+    name: "🍎 HomePod · Route replies through Morgan"
+    description: >-
+      When enabled, route assistant replies to the configured HomePod using
+      the Morgan Fish Audio voice; when unavailable, keep native Voice PE audio.
+  homepod_route_policy:
+    name: "🍎 HomePod · Routing policy"
+    description: >-
+      "all" routes every reply; "post_tool_only" routes only replies after a
+      Home Assistant tool call and leaves ordinary conversation on Voice PE.
+  homepod_target_entity:
+    name: "🍎 HomePod · Default target entity"
+    description: >-
+      Home Assistant media_player used when no per-client mapping matches.
+  homepod_target_map:
+    name: "🍎 HomePod · Per-client target map (JSON)"
+    description: >-
+      Optional JSON object keyed by Voice PE source IP, with "default" as a
+      fallback, for example {"192.168.1.50":"media_player.cuisine_homepod"}.
 
   # --- 🏠 Home Assistant ---
   ha_mcp_url:

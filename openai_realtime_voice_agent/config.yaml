@@ -50,6 +50,7 @@ options:
   homepod_routing_enabled: true
   homepod_route_policy: "all"
   homepod_target_entity: "media_player.salon_salon_homepod"
+  homepod_target_map: "{}"
   homepod_tts_entity: "tts.maison_cognitive_morgan_maison_cognitive_morgan"
   homepod_timeout_seconds: 30.0
   homepod_pretool_hold_seconds: 1.0
@@ -95,6 +96,7 @@ schema:
   homepod_routing_enabled: bool
   homepod_route_policy: "list(all|post_tool_only)"
   homepod_target_entity: str
+  homepod_target_map: str
   homepod_tts_entity: str
   homepod_timeout_seconds: float(1,120)
   homepod_pretool_hold_seconds: float(0,30)

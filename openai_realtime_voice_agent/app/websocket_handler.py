@@ -534,13 +534,11 @@ class WebSocketHandler:
         if os.environ.get("HOMEPOD_ROUTING_ENABLED", "true").strip().lower() in {
             "1", "true", "yes", "on"
         }:
+            target_entity = self._homepod_target_for_client(client_id)
             pipeline_components.append(
                 HomePodSpeechRouter(
                     route_policy=os.environ.get("HOMEPOD_ROUTE_POLICY", "all"),
-                    target_entity=os.environ.get(
-                        "HOMEPOD_TARGET_ENTITY",
-                        "media_player.salon_salon_homepod",
-                    ),
+                    target_entity=target_entity,
                     tts_entity=os.environ.get(
                         "HOMEPOD_TTS_ENTITY",
                         "tts.maison_cognitive_morgan_maison_cognitive_morgan",
@@ -755,6 +753,36 @@ class WebSocketHandler:
             self._serializer.set_wake_handler(_on_device_wake)
 
         return pipeline, runner, task
+
+    @staticmethod
+    def _homepod_target_for_client(client_id: str) -> str:
+        """Resolve a HomePod target from the connection identity.
+
+        Voice PE currently identifies itself to this add-on only by source IP.
+        ``HOMEPOD_TARGET_MAP`` is an optional JSON object keyed by that client
+        ID, with ``default`` as a fallback. Invalid maps never disable audio:
+        the configured ``HOMEPOD_TARGET_ENTITY`` remains the safe fallback.
+        """
+        fallback = os.environ.get(
+            "HOMEPOD_TARGET_ENTITY", "media_player.salon_salon_homepod"
+        ).strip()
+        raw_map = os.environ.get("HOMEPOD_TARGET_MAP", "{}").strip()
+        if not raw_map:
+            return fallback
+        try:
+            mapping = json.loads(raw_map)
+        except (TypeError, json.JSONDecodeError) as exc:
+            logger.warning("⚠️ Invalid HOMEPOD_TARGET_MAP; using default: %r", exc)
+            return fallback
+        if not isinstance(mapping, dict):
+            logger.warning("⚠️ HOMEPOD_TARGET_MAP must be a JSON object; using default")
+            return fallback
+        target = mapping.get(client_id, mapping.get("default", fallback))
+        if not isinstance(target, str) or not target.strip():
+            logger.warning("⚠️ Empty HomePod target for client %s; using default", client_id)
+            return fallback
+        logger.info("🍎 HomePod route for client %s → %s", client_id, target.strip())
+        return target.strip()
     
     def extract_client_id(self, websocket) -> str:
         """
