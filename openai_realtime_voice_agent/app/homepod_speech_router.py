@@ -464,14 +464,12 @@ class HomePodSpeechRouter(FrameProcessor):
     ) -> None:
         if audio_frames:
             logger.warning(
-                "🔊 HomePod router: diffusion de secours sur Voice PE "
-                f"({len(audio_frames)} trames PCM)"
+                "🔇 HomePod router: audio local supprimé pour conserver "
+                "Morgan exclusivement (routage HomePod indisponible; "
+                f"{len(audio_frames)} trames PCM)"
             )
         else:
-            logger.debug("HomePod router: fallback sans PCM à restituer")
-
-        for audio_frame in audio_frames:
-            await self.push_frame(audio_frame, direction)
+            logger.debug("HomePod router: aucun audio local à supprimer")
 
     def _stop_pending_task(self) -> None:
         task = self._pending_task
