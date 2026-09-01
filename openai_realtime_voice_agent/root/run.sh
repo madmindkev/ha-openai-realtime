@@ -33,6 +33,8 @@ HOMEPOD_TARGET_MAP=$(bashio::config 'homepod_target_map')
 HOMEPOD_TTS_ENTITY=$(bashio::config 'homepod_tts_entity')
 HOMEPOD_TIMEOUT_SECONDS=$(bashio::config 'homepod_timeout_seconds')
 HOMEPOD_PRETOOL_HOLD_SECONDS=$(bashio::config 'homepod_pretool_hold_seconds')
+HOMEPOD_TOOL_FILLER_HOLD_SECONDS=$(bashio::config 'homepod_tool_filler_hold_seconds')
+HOMEPOD_COMPLETE_HOLD_SECONDS=$(bashio::config 'homepod_complete_hold_seconds')
 HOMEPOD_PRETOOL_HOLD_MAX_CHARS=$(bashio::config 'homepod_pretool_hold_max_chars')
 HOMEPOD_CONTINUATION_HOLD_SECONDS=$(bashio::config 'homepod_continuation_hold_seconds')
 HOMEPOD_CONTINUATION_HOLD_MAX_CHARS=$(bashio::config 'homepod_continuation_hold_max_chars')
@@ -85,6 +87,8 @@ export HOMEPOD_TARGET_MAP
 export HOMEPOD_TTS_ENTITY
 export HOMEPOD_TIMEOUT_SECONDS
 export HOMEPOD_PRETOOL_HOLD_SECONDS
+export HOMEPOD_TOOL_FILLER_HOLD_SECONDS
+export HOMEPOD_COMPLETE_HOLD_SECONDS
 export HOMEPOD_PRETOOL_HOLD_MAX_CHARS
 export HOMEPOD_CONTINUATION_HOLD_SECONDS
 export HOMEPOD_CONTINUATION_HOLD_MAX_CHARS

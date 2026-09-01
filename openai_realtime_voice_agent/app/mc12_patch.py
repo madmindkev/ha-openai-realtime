@@ -49,11 +49,24 @@ _ORIGINAL_ROUTER_INIT = HomePodSpeechRouter.__init__
 
 def _mc12_router_init(self, *args, **kwargs):
     _ORIGINAL_ROUTER_INIT(self, *args, **kwargs)
-    self._mc12_generic_pretool_hold_seconds = 0.75
+    self._mc12_generic_pretool_hold_seconds = self._env_float(
+        "HOMEPOD_PRETOOL_HOLD_SECONDS", 0.75, minimum=0.0
+    )
     self._mc12_generic_pretool_max_chars = 220
-    # Preserve the values already validated in mc10/mc11.
-    self._mc10_tool_filler_hold_seconds = 1.5
-    self._continuation_hold_seconds = 2.0
+    self._mc10_tool_filler_hold_seconds = self._env_float(
+        "HOMEPOD_TOOL_FILLER_HOLD_SECONDS", 1.5, minimum=0.0
+    )
+    self._continuation_hold_seconds = self._env_float(
+        "HOMEPOD_CONTINUATION_HOLD_SECONDS", 2.0, minimum=0.0
+    )
+    logger.info(
+        "🍎 HomePod hold policy effective: generic_pretool=%.2fs "
+        "tool_filler=%.2fs continuation=%.2fs complete=%.2fs",
+        self._mc12_generic_pretool_hold_seconds,
+        self._mc10_tool_filler_hold_seconds,
+        self._continuation_hold_seconds,
+        self._mc9_complete_hold_seconds,
+    )
 
 
 def _mc12_hold_seconds_for_text(self, text: str, *, post_tool: bool) -> float:

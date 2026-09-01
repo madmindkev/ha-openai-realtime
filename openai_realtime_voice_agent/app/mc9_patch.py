@@ -65,12 +65,20 @@ _TOOL_FILLER_PREFIXES = (
 def _mc9_router_init(self, *args, **kwargs):
     _ORIGINAL_ROUTER_INIT(self, *args, **kwargs)
 
-    # mc8 values were 1.0 s / 3.2 s. Keep the robust filler guard but reduce the
-    # expensive incomplete-fragment window now that the merger is proven live.
-    self._pretool_hold_seconds = 1.0
-    self._continuation_hold_seconds = 2.0
-    self._mc9_complete_hold_seconds = 0.35
-    self._mc9_tool_filler_hold_seconds = 1.0
+    # Keep mc12's effective defaults while allowing the add-on options to reach
+    # the attributes used by the final hold policy.
+    self._pretool_hold_seconds = self._env_float(
+        "HOMEPOD_PRETOOL_HOLD_SECONDS", 0.75, minimum=0.0
+    )
+    self._continuation_hold_seconds = self._env_float(
+        "HOMEPOD_CONTINUATION_HOLD_SECONDS", 2.0, minimum=0.0
+    )
+    self._mc9_complete_hold_seconds = self._env_float(
+        "HOMEPOD_COMPLETE_HOLD_SECONDS", 0.35, minimum=0.0
+    )
+    self._mc9_tool_filler_hold_seconds = self._env_float(
+        "HOMEPOD_TOOL_FILLER_HOLD_SECONDS", 1.5, minimum=0.0
+    )
 
 
 def _looks_like_tool_filler(text: str) -> bool:
