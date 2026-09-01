@@ -47,6 +47,19 @@ options:
   playback_prebuffer_ms: 150
   noise_reduction: "off"
 
+  homepod_routing_enabled: true
+  homepod_target_entity: "media_player.salon_salon_homepod"
+  homepod_tts_entity: "tts.maison_cognitive_morgan_maison_cognitive_morgan"
+  homepod_timeout_seconds: 30.0
+  homepod_pretool_hold_seconds: 1.0
+  homepod_pretool_hold_max_chars: 160
+  homepod_continuation_hold_seconds: 3.2
+  homepod_continuation_hold_max_chars: 420
+  homepod_tts_chars_per_second: 15.0
+  homepod_tts_startup_seconds: 0.8
+  homepod_tts_min_seconds: 1.4
+  homepod_tts_max_seconds: 30.0
+
   ha_mcp_url: ""
   longlived_token: ""
   mcp_tool_allowlist: ""
@@ -78,6 +91,18 @@ schema:
   web_search_model_custom: str?
   playback_prebuffer_ms: int(0,2000)
   noise_reduction: "list(off|near_field|far_field)"
+  homepod_routing_enabled: bool
+  homepod_target_entity: str
+  homepod_tts_entity: str
+  homepod_timeout_seconds: float(1,120)
+  homepod_pretool_hold_seconds: float(0,30)
+  homepod_pretool_hold_max_chars: int(1,2000)
+  homepod_continuation_hold_seconds: float(0,30)
+  homepod_continuation_hold_max_chars: int(1,5000)
+  homepod_tts_chars_per_second: float(5,100)
+  homepod_tts_startup_seconds: float(0,10)
+  homepod_tts_min_seconds: float(0.2,60)
+  homepod_tts_max_seconds: float(1,120)
   ha_mcp_url: str
   longlived_token: password
   mcp_tool_allowlist: str

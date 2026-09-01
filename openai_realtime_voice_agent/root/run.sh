@@ -26,6 +26,18 @@ WEB_SEARCH_MODEL=$(bashio::config 'web_search_model')
 # --- 🎚️ Audio ---
 PLAYBACK_PREBUFFER_MS=$(bashio::config 'playback_prebuffer_ms')
 NOISE_REDUCTION=$(bashio::config 'noise_reduction')
+HOMEPOD_ROUTING_ENABLED=$(bashio::config 'homepod_routing_enabled')
+HOMEPOD_TARGET_ENTITY=$(bashio::config 'homepod_target_entity')
+HOMEPOD_TTS_ENTITY=$(bashio::config 'homepod_tts_entity')
+HOMEPOD_TIMEOUT_SECONDS=$(bashio::config 'homepod_timeout_seconds')
+HOMEPOD_PRETOOL_HOLD_SECONDS=$(bashio::config 'homepod_pretool_hold_seconds')
+HOMEPOD_PRETOOL_HOLD_MAX_CHARS=$(bashio::config 'homepod_pretool_hold_max_chars')
+HOMEPOD_CONTINUATION_HOLD_SECONDS=$(bashio::config 'homepod_continuation_hold_seconds')
+HOMEPOD_CONTINUATION_HOLD_MAX_CHARS=$(bashio::config 'homepod_continuation_hold_max_chars')
+HOMEPOD_TTS_CHARS_PER_SECOND=$(bashio::config 'homepod_tts_chars_per_second')
+HOMEPOD_TTS_STARTUP_SECONDS=$(bashio::config 'homepod_tts_startup_seconds')
+HOMEPOD_TTS_MIN_SECONDS=$(bashio::config 'homepod_tts_min_seconds')
+HOMEPOD_TTS_MAX_SECONDS=$(bashio::config 'homepod_tts_max_seconds')
 
 # --- 🏠 Home Assistant ---
 HA_MCP_URL=$(bashio::config 'ha_mcp_url')
@@ -64,6 +76,18 @@ export ENABLE_WEB_SEARCH
 export WEB_SEARCH_MODEL
 export PLAYBACK_PREBUFFER_MS
 export NOISE_REDUCTION
+export HOMEPOD_ROUTING_ENABLED
+export HOMEPOD_TARGET_ENTITY
+export HOMEPOD_TTS_ENTITY
+export HOMEPOD_TIMEOUT_SECONDS
+export HOMEPOD_PRETOOL_HOLD_SECONDS
+export HOMEPOD_PRETOOL_HOLD_MAX_CHARS
+export HOMEPOD_CONTINUATION_HOLD_SECONDS
+export HOMEPOD_CONTINUATION_HOLD_MAX_CHARS
+export HOMEPOD_TTS_CHARS_PER_SECOND
+export HOMEPOD_TTS_STARTUP_SECONDS
+export HOMEPOD_TTS_MIN_SECONDS
+export HOMEPOD_TTS_MAX_SECONDS
 export LONGLIVED_TOKEN
 export MCP_TOOL_ALLOWLIST
 export WEBSOCKET_PORT

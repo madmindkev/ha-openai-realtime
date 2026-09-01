@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Optional, Callable, Awaitable, Dict
@@ -530,7 +531,24 @@ class WebSocketHandler:
         # BotStoppedSpeakingFrame. The assistant aggregator still receives the
         # original text/boundary frames (the router forwards them) and therefore
         # keeps conversation context correct.
-        pipeline_components.append(HomePodSpeechRouter())
+        if os.environ.get("HOMEPOD_ROUTING_ENABLED", "true").strip().lower() in {
+            "1", "true", "yes", "on"
+        }:
+            pipeline_components.append(
+                HomePodSpeechRouter(
+                    target_entity=os.environ.get(
+                        "HOMEPOD_TARGET_ENTITY",
+                        "media_player.salon_salon_homepod",
+                    ),
+                    tts_entity=os.environ.get(
+                        "HOMEPOD_TTS_ENTITY",
+                        "tts.maison_cognitive_morgan_maison_cognitive_morgan",
+                    ),
+                    timeout_seconds=float(
+                        os.environ.get("HOMEPOD_TIMEOUT_SECONDS", "30.0")
+                    ),
+                )
+            )
 
         if context_aggregator:
             pipeline_components.append(context_aggregator.assistant())
