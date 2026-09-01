@@ -18,6 +18,7 @@ fragment-merging logic stay intact.
 import asyncio
 import json
 import logging
+import os
 import time
 import unicodedata
 import urllib.error
@@ -75,6 +76,10 @@ def _mc10_router_init(self, *args, **kwargs):
     self._continuation_hold_seconds = 2.0
     self._mc10_raop_probe_seconds = 8.0
     self._mc10_raop_probe_interval = 0.12
+    # Tolérance de comparaison du volume : en deçà, volume_set est sauté.
+    self._mc10_volume_tolerance = _mc10_env_float(
+        "HOMEPOD_VOLUME_TOLERANCE", 0.02, minimum=0.0
+    )
 
 
 def _mc10_hold_seconds_for_text(self, text: str, *, post_tool: bool) -> float:
@@ -90,6 +95,19 @@ def _mc10_hold_seconds_for_text(self, text: str, *, post_tool: bool) -> float:
         return self._mc10_complete_hold_seconds
 
     return 0.0
+
+
+def _mc10_env_float(name: str, default: float, *, minimum: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+def _conversation_volume_for_hour(hour: int) -> float:
+    """Politique maison : jour 75 %, soirée 60 %, nuit 25 %."""
+    return 0.25 if hour >= 23 or hour < 7 else 0.60 if hour >= 18 else 0.75
 
 
 def _state_marker(data: dict | None):
@@ -164,22 +182,44 @@ async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
         return False, 0.0
 
     try:
-        # Keep conversational replies audible with the same house policy as
-        # proactive announcements: day 75%, evening 60%, night 25%.
-        hour = time.localtime().tm_hour
-        conversation_volume = (
-            0.25 if hour >= 23 or hour < 7 else 0.60 if hour >= 18 else 0.75
+        # Un seul GET d'état sert au volume ET de ligne de base à la sonde RAOP :
+        # une requête HTTP de moins sur le chemin critique.
+        state_started = time.monotonic()
+        before = await asyncio.to_thread(_get_homepod_state_sync, self)
+        state_elapsed = time.monotonic() - state_started
+
+        conversation_volume = _conversation_volume_for_hour(time.localtime().tm_hour)
+        current_volume = None
+        if isinstance(before, dict):
+            raw_volume = (before.get("attributes") or {}).get("volume_level")
+            if isinstance(raw_volume, (int, float)):
+                current_volume = float(raw_volume)
+
+        volume_task = None
+        volume_skipped = (
+            current_volume is not None
+            and abs(current_volume - conversation_volume) <= self._mc10_volume_tolerance
         )
-        await asyncio.to_thread(
-            self._request_service_sync,
-            "media_player",
-            "volume_set",
-            {
-                "entity_id": self._target_entity,
-                "volume_level": conversation_volume,
-            },
-            token,
-        )
+        if volume_skipped:
+            logger.info(
+                "🔈 HomePod router: volume déjà à %.2f, volume_set sauté",
+                conversation_volume,
+            )
+        else:
+            # Lancé en parallèle de tts_get_url : volume_set n'est attendu qu'avant
+            # play_media, seul instant où il doit réellement avoir pris effet.
+            volume_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._request_service_sync,
+                    "media_player",
+                    "volume_set",
+                    {
+                        "entity_id": self._target_entity,
+                        "volume_level": conversation_volume,
+                    },
+                    token,
+                )
+            )
 
         # 1) Generate the lazy Morgan stream URL.
         url_started = time.monotonic()
@@ -208,7 +248,12 @@ async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
         # second worker polls HA state. This gives us an approximation of the
         # AirPlay/RAOP start transition instead of confusing full playback time
         # with startup latency.
-        before = await asyncio.to_thread(_get_homepod_state_sync, self)
+        volume_elapsed = 0.0
+        if volume_task is not None:
+            volume_started = time.monotonic()
+            await volume_task
+            volume_elapsed = time.monotonic() - volume_started
+
         play_started_at = time.monotonic()
         play_task = asyncio.create_task(
             asyncio.to_thread(
@@ -241,6 +286,7 @@ async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
         play_elapsed = time.monotonic() - play_started_at
         total_elapsed = time.monotonic() - started
 
+        transition = None
         if probe_task.done() and not probe_task.cancelled():
             try:
                 transition = probe_task.result()
@@ -253,17 +299,17 @@ async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
                 )
 
         logger.info(
-            "🍎 HomePod router: play_media terminé en %.2fs vers %s",
-            play_elapsed,
-            self._target_entity,
-        )
-        logger.info(
-            "⚡ HomePod router: fast path Morgan accepté "
-            "(%d caractères, URL %.2fs, play_media %.2fs, total %.2fs)",
-            len(text),
+            "⏱️ HomePod router: état=%.2fs volume=%.2fs%s url=%.2fs "
+            "play_media=%.2fs demarrage_raop=%s total=%.2fs (%d car.) vers %s",
+            state_elapsed,
+            volume_elapsed,
+            " (sauté)" if volume_skipped else "",
             url_elapsed,
             play_elapsed,
+            "%.2fs" % transition if transition is not None else "non détecté",
             total_elapsed,
+            len(text),
+            self._target_entity,
         )
         return True, total_elapsed
 
