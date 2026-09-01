@@ -164,6 +164,23 @@ async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
         return False, 0.0
 
     try:
+        # Keep conversational replies audible with the same house policy as
+        # proactive announcements: day 75%, evening 60%, night 25%.
+        hour = time.localtime().tm_hour
+        conversation_volume = (
+            0.25 if hour >= 23 or hour < 7 else 0.60 if hour >= 18 else 0.75
+        )
+        await asyncio.to_thread(
+            self._request_service_sync,
+            "media_player",
+            "volume_set",
+            {
+                "entity_id": self._target_entity,
+                "volume_level": conversation_volume,
+            },
+            token,
+        )
+
         # 1) Generate the lazy Morgan stream URL.
         url_started = time.monotonic()
         tts_data = await asyncio.to_thread(
