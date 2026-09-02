@@ -80,6 +80,11 @@ def _mc10_router_init(self, *args, **kwargs):
     self._mc10_volume_tolerance = _mc10_env_float(
         "HOMEPOD_VOLUME_TOLERANCE", 0.02, minimum=0.0
     )
+    # Le réglage de volume est opportuniste : il ne doit jamais retarder ni
+    # rendre silencieuse une réponse Morgan si pyatv ne répond pas.
+    self._mc10_volume_wait_seconds = _mc10_env_float(
+        "HOMEPOD_VOLUME_WAIT_SECONDS", 0.20, minimum=0.0
+    )
 
 
 def _mc10_hold_seconds_for_text(self, text: str, *, post_tool: bool) -> float:
@@ -174,6 +179,16 @@ async def _probe_raop_start(router, before: dict, play_started_at: float, play_t
     return None
 
 
+def _log_detached_volume(task: asyncio.Task) -> None:
+    """Consume a late volume_set result so pyatv errors stay observable."""
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception as exc:
+        logger.warning("⚠️ HomePod router: volume_set différé échoué: %r", exc)
+
+
 async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
     started = time.monotonic()
     token = self._get_ha_token()
@@ -251,8 +266,33 @@ async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
         volume_elapsed = 0.0
         if volume_task is not None:
             volume_started = time.monotonic()
-            await volume_task
-            volume_elapsed = time.monotonic() - volume_started
+            try:
+                # La commande peut rester bloquée ~5 s dans pyatv/MRP. Elle ne
+                # doit pas empêcher tts_get_url ni play_media de démarrer.
+                done, _ = await asyncio.wait(
+                    {volume_task}, timeout=self._mc10_volume_wait_seconds
+                )
+                if volume_task not in done:
+                    raise asyncio.TimeoutError
+                # Récupérer le résultat ici rend toute exception immédiate
+                # observable sans la propager au chemin TTS.
+                volume_task.result()
+                volume_elapsed = time.monotonic() - volume_started
+            except asyncio.TimeoutError:
+                volume_elapsed = time.monotonic() - volume_started
+                volume_task.add_done_callback(_log_detached_volume)
+                logger.warning(
+                    "⚠️ HomePod router: volume_set encore en cours après %.2fs; "
+                    "poursuite de la réponse Morgan",
+                    volume_elapsed,
+                )
+            except Exception as volume_exc:
+                volume_elapsed = time.monotonic() - volume_started
+                logger.warning(
+                    "⚠️ HomePod router: volume_set ignoré après %.2fs: %r",
+                    volume_elapsed,
+                    volume_exc,
+                )
 
         play_started_at = time.monotonic()
         play_task = asyncio.create_task(
