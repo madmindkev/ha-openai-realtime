@@ -8,8 +8,10 @@ mc10 builds on the validated mc9 behaviour and changes only two things:
    still uses the proven 2.0 s continuation window.
 2. Measure where HomePod/AirPlay startup time is spent. Morgan URL generation
    and HomePod media-state transition are timed separately while play_media is
-   running; play_media itself is still awaited so follow-up only reopens after
-   the HomePod stream has really ended.
+   running. Once the current request is confirmed as playing, the router can
+   return early while keeping a per-HomePod playback lock until the HTTP call
+   really ends. This keeps follow-up responsive without overlapping RAOP
+   streams.
 
 mc9 is imported explicitly here so its immediate post-HomePod follow-up and
 fragment-merging logic stay intact.
@@ -75,7 +77,14 @@ def _mc10_router_init(self, *args, **kwargs):
     self._mc10_tool_filler_hold_seconds = 1.5
     self._continuation_hold_seconds = 2.0
     self._mc10_raop_probe_seconds = 8.0
-    self._mc10_raop_probe_interval = 0.12
+    self._mc10_raop_probe_interval = 0.08
+    self._mc10_early_return_on_raop = _mc10_env_bool(
+        "HOMEPOD_EARLY_RETURN_ON_RAOP", True
+    )
+    # pyatv permits only one RAOP stream per HomePod. Keep the HTTP
+    # play_media call serialized even when the foreground coroutine returns
+    # as soon as the current stream is confirmed playing.
+    self._mc10_playback_lock = asyncio.Lock()
     # Tolérance de comparaison du volume : en deçà, volume_set est sauté.
     self._mc10_volume_tolerance = _mc10_env_float(
         "HOMEPOD_VOLUME_TOLERANCE", 0.02, minimum=0.0
@@ -108,6 +117,13 @@ def _mc10_env_float(name: str, default: float, *, minimum: float) -> float:
     except (TypeError, ValueError):
         value = default
     return max(minimum, value)
+
+
+def _mc10_env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip().lower() in {"", "null", "none"}:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _conversation_volume_for_hour(hour: int) -> float:
@@ -150,7 +166,13 @@ def _get_homepod_state_sync(router) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-async def _probe_raop_start(router, before: dict, play_started_at: float, play_task):
+async def _probe_raop_start(
+    router,
+    before: dict,
+    play_started_at: float,
+    play_task,
+    expected_media_url: str,
+):
     before_marker = _state_marker(before)
     before_state = before.get("state") if isinstance(before, dict) else None
 
@@ -159,10 +181,19 @@ async def _probe_raop_start(router, before: dict, play_started_at: float, play_t
         current = await asyncio.to_thread(_get_homepod_state_sync, router)
         current_marker = _state_marker(current)
         current_state = current.get("state") if isinstance(current, dict) else None
+        current_media_id = str(
+            (current.get("attributes") or {}).get("media_content_id") or ""
+        ).strip()
 
         changed = bool(current_marker and current_marker != before_marker)
         started_playing = current_state == "playing" and before_state != "playing"
-        if changed or started_playing:
+        # An unrelated announcement can change this entity while our request is
+        # blocked. Only confirm the transition when it belongs to this exact
+        # tts_get_url result.
+        media_matches = bool(
+            expected_media_url and current_media_id == expected_media_url
+        )
+        if media_matches and current_state == "playing" and (changed or started_playing):
             elapsed = time.monotonic() - play_started_at
             logger.info(
                 "⏱️ HomePod router: transition RAOP détectée après %.2fs "
@@ -189,6 +220,19 @@ def _log_detached_volume(task: asyncio.Task) -> None:
         logger.warning("⚠️ HomePod router: volume_set différé échoué: %r", exc)
 
 
+def _log_detached_play(task: asyncio.Task) -> None:
+    """Consume a background play_media result after an early RAOP return."""
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception as exc:
+        logger.warning(
+            "⚠️ HomePod router: play_media détaché échoué après démarrage confirmé: %r",
+            exc,
+        )
+
+
 async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
     started = time.monotonic()
     token = self._get_ha_token()
@@ -196,190 +240,229 @@ async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
         logger.warning("⚠️ HomePod router: aucun jeton HA, fallback Voice PE")
         return False, 0.0
 
+    lock_started = time.monotonic()
+    await self._mc10_playback_lock.acquire()
+    lock_wait = time.monotonic() - lock_started
+    lock_released = False
+    detached_play = False
+
+    def release_playback_lock(_task=None):
+        nonlocal lock_released
+        if lock_released:
+            return
+        lock_released = True
+        self._mc10_playback_lock.release()
+
     try:
-        # Un seul GET d'état sert au volume ET de ligne de base à la sonde RAOP :
-        # une requête HTTP de moins sur le chemin critique.
-        state_started = time.monotonic()
-        before = await asyncio.to_thread(_get_homepod_state_sync, self)
-        state_elapsed = time.monotonic() - state_started
+        try:
+            # Un seul GET d'état sert au volume ET de ligne de base à la sonde RAOP :
+            # une requête HTTP de moins sur le chemin critique.
+            state_started = time.monotonic()
+            before = await asyncio.to_thread(_get_homepod_state_sync, self)
+            state_elapsed = time.monotonic() - state_started
 
-        conversation_volume = _conversation_volume_for_hour(time.localtime().tm_hour)
-        current_volume = None
-        if isinstance(before, dict):
-            raw_volume = (before.get("attributes") or {}).get("volume_level")
-            if isinstance(raw_volume, (int, float)):
-                current_volume = float(raw_volume)
+            conversation_volume = _conversation_volume_for_hour(time.localtime().tm_hour)
+            current_volume = None
+            if isinstance(before, dict):
+                raw_volume = (before.get("attributes") or {}).get("volume_level")
+                if isinstance(raw_volume, (int, float)):
+                    current_volume = float(raw_volume)
 
-        volume_task = None
-        volume_skipped = (
-            current_volume is not None
-            and abs(current_volume - conversation_volume) <= self._mc10_volume_tolerance
-        )
-        if volume_skipped:
-            logger.info(
-                "🔈 HomePod router: volume déjà à %.2f, volume_set sauté",
-                conversation_volume,
+            volume_task = None
+            volume_skipped = (
+                current_volume is not None
+                and abs(current_volume - conversation_volume) <= self._mc10_volume_tolerance
             )
-        else:
-            # Lancé en parallèle de tts_get_url : volume_set n'est attendu qu'avant
-            # play_media, seul instant où il doit réellement avoir pris effet.
-            volume_task = asyncio.create_task(
+            if volume_skipped:
+                logger.info(
+                    "🔈 HomePod router: volume déjà à %.2f, volume_set sauté",
+                    conversation_volume,
+                )
+            else:
+                # Lancé en parallèle de tts_get_url : volume_set n'est attendu qu'avant
+                # play_media, seul instant où il doit réellement avoir pris effet.
+                volume_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._request_service_sync,
+                        "media_player",
+                        "volume_set",
+                        {
+                            "entity_id": self._target_entity,
+                            "volume_level": conversation_volume,
+                        },
+                        token,
+                    )
+                )
+
+            # 1) Generate the lazy Morgan stream URL.
+            url_started = time.monotonic()
+            tts_data = await asyncio.to_thread(
+                self._request_json_sync,
+                f"{self._ha_api_base}/tts_get_url",
+                {
+                    "engine_id": self._tts_entity,
+                    "message": text,
+                    "cache": False,
+                },
+                token,
+            )
+            url_elapsed = time.monotonic() - url_started
+            media_url = str(tts_data.get("url") or "").strip()
+            if not media_url:
+                raise RuntimeError("/api/tts_get_url n'a renvoyé aucune URL")
+
+            logger.info(
+                "🐟 HomePod router: URL Morgan prête en %.2fs via %s",
+                url_elapsed,
+                self._tts_entity,
+            )
+
+            # 2) Start play_media in one worker while a second worker polls HA.
+            # The lock stays held by the background task if we return early.
+            volume_elapsed = 0.0
+            if volume_task is not None:
+                volume_started = time.monotonic()
+                try:
+                    # La commande peut rester bloquée ~5 s dans pyatv/MRP. Elle ne
+                    # doit pas empêcher tts_get_url ni play_media de démarrer.
+                    done, _ = await asyncio.wait(
+                        {volume_task}, timeout=self._mc10_volume_wait_seconds
+                    )
+                    if volume_task not in done:
+                        raise asyncio.TimeoutError
+                    volume_task.result()
+                    volume_elapsed = time.monotonic() - volume_started
+                except asyncio.TimeoutError:
+                    volume_elapsed = time.monotonic() - volume_started
+                    volume_task.add_done_callback(_log_detached_volume)
+                    logger.warning(
+                        "⚠️ HomePod router: volume_set encore en cours après %.2fs; "
+                        "poursuite de la réponse Morgan",
+                        volume_elapsed,
+                    )
+                except Exception as volume_exc:
+                    volume_elapsed = time.monotonic() - volume_started
+                    logger.warning(
+                        "⚠️ HomePod router: volume_set ignoré après %.2fs: %r",
+                        volume_elapsed,
+                        volume_exc,
+                    )
+
+            play_started_at = time.monotonic()
+            play_task = asyncio.create_task(
                 asyncio.to_thread(
                     self._request_service_sync,
                     "media_player",
-                    "volume_set",
+                    "play_media",
                     {
                         "entity_id": self._target_entity,
-                        "volume_level": conversation_volume,
+                        "media_content_id": media_url,
+                        "media_content_type": "music",
+                        "announce": True,
                     },
                     token,
                 )
             )
-
-        # 1) Generate the lazy Morgan stream URL.
-        url_started = time.monotonic()
-        tts_data = await asyncio.to_thread(
-            self._request_json_sync,
-            f"{self._ha_api_base}/tts_get_url",
-            {
-                "engine_id": self._tts_entity,
-                "message": text,
-                "cache": False,
-            },
-            token,
-        )
-        url_elapsed = time.monotonic() - url_started
-        media_url = str(tts_data.get("url") or "").strip()
-        if not media_url:
-            raise RuntimeError("/api/tts_get_url n'a renvoyé aucune URL")
-
-        logger.info(
-            "🐟 HomePod router: URL Morgan prête en %.2fs via %s",
-            url_elapsed,
-            self._tts_entity,
-        )
-
-        # 2) Snapshot HomePod state, then start play_media in one worker while a
-        # second worker polls HA state. This gives us an approximation of the
-        # AirPlay/RAOP start transition instead of confusing full playback time
-        # with startup latency.
-        volume_elapsed = 0.0
-        if volume_task is not None:
-            volume_started = time.monotonic()
-            try:
-                # La commande peut rester bloquée ~5 s dans pyatv/MRP. Elle ne
-                # doit pas empêcher tts_get_url ni play_media de démarrer.
-                done, _ = await asyncio.wait(
-                    {volume_task}, timeout=self._mc10_volume_wait_seconds
-                )
-                if volume_task not in done:
-                    raise asyncio.TimeoutError
-                # Récupérer le résultat ici rend toute exception immédiate
-                # observable sans la propager au chemin TTS.
-                volume_task.result()
-                volume_elapsed = time.monotonic() - volume_started
-            except asyncio.TimeoutError:
-                volume_elapsed = time.monotonic() - volume_started
-                volume_task.add_done_callback(_log_detached_volume)
-                logger.warning(
-                    "⚠️ HomePod router: volume_set encore en cours après %.2fs; "
-                    "poursuite de la réponse Morgan",
-                    volume_elapsed,
-                )
-            except Exception as volume_exc:
-                volume_elapsed = time.monotonic() - volume_started
-                logger.warning(
-                    "⚠️ HomePod router: volume_set ignoré après %.2fs: %r",
-                    volume_elapsed,
-                    volume_exc,
-                )
-
-        play_started_at = time.monotonic()
-        play_task = asyncio.create_task(
-            asyncio.to_thread(
-                self._request_service_sync,
-                "media_player",
-                "play_media",
-                {
-                    "entity_id": self._target_entity,
-                    "media_content_id": media_url,
-                    "media_content_type": "music",
-                    "announce": True,
-                },
-                token,
+            probe_task = asyncio.create_task(
+                _probe_raop_start(self, before, play_started_at, play_task, media_url)
             )
-        )
-        probe_task = asyncio.create_task(
-            _probe_raop_start(self, before, play_started_at, play_task)
-        )
+
+            try:
+                if self._mc10_early_return_on_raop:
+                    done, _ = await asyncio.wait(
+                        {play_task, probe_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if probe_task in done and not play_task.done():
+                        try:
+                            transition = probe_task.result()
+                        except Exception:
+                            transition = None
+                        if transition is not None:
+                            detached_play = True
+                            play_task.add_done_callback(_log_detached_play)
+                            play_task.add_done_callback(release_playback_lock)
+                            total_elapsed = time.monotonic() - started
+                            logger.info(
+                                "⏱️ HomePod router: retour rapide après démarrage RAOP "
+                                "%.2fs (attente verrou %.2fs, total %.2fs, play_media "
+                                "maintenu en arrière-plan; %d car.)",
+                                transition,
+                                lock_wait,
+                                total_elapsed,
+                                len(text),
+                            )
+                            return True, total_elapsed
+
+                await play_task
+            finally:
+                if not detached_play:
+                    if not probe_task.done():
+                        probe_task.cancel()
+                    try:
+                        await probe_task
+                    except asyncio.CancelledError:
+                        pass
+
+            play_elapsed = time.monotonic() - play_started_at
+            total_elapsed = time.monotonic() - started
+
+            transition = None
+            if probe_task.done() and not probe_task.cancelled():
+                try:
+                    transition = probe_task.result()
+                except Exception:
+                    transition = None
+                if transition is None:
+                    logger.info(
+                        "⏱️ HomePod router: aucune transition d'état RAOP exploitable "
+                        "avant la fin de play_media"
+                    )
+
+            logger.info(
+                "⏱️ HomePod router: verrou=%.2fs état=%.2fs volume=%.2fs%s url=%.2fs "
+                "play_media=%.2fs demarrage_raop=%s total=%.2fs (%d car.) vers %s",
+                lock_wait,
+                state_elapsed,
+                volume_elapsed,
+                " (sauté)" if volume_skipped else "",
+                url_elapsed,
+                play_elapsed,
+                "%.2fs" % transition if transition is not None else "non détecté",
+                total_elapsed,
+                len(text),
+                self._target_entity,
+            )
+            return True, total_elapsed
+        except Exception as fast_exc:
+            logger.warning(
+                "↩️ HomePod router: fast path mc10 indisponible, fallback tts.speak: %r",
+                fast_exc,
+            )
 
         try:
-            await play_task
-        finally:
-            if not probe_task.done():
-                probe_task.cancel()
-                try:
-                    await probe_task
-                except asyncio.CancelledError:
-                    pass
-
-        play_elapsed = time.monotonic() - play_started_at
-        total_elapsed = time.monotonic() - started
-
-        transition = None
-        if probe_task.done() and not probe_task.cancelled():
-            try:
-                transition = probe_task.result()
-            except Exception:
-                transition = None
-            if transition is None:
-                logger.info(
-                    "⏱️ HomePod router: aucune transition d'état RAOP exploitable "
-                    "avant la fin de play_media"
-                )
-
-        logger.info(
-            "⏱️ HomePod router: état=%.2fs volume=%.2fs%s url=%.2fs "
-            "play_media=%.2fs demarrage_raop=%s total=%.2fs (%d car.) vers %s",
-            state_elapsed,
-            volume_elapsed,
-            " (sauté)" if volume_skipped else "",
-            url_elapsed,
-            play_elapsed,
-            "%.2fs" % transition if transition is not None else "non détecté",
-            total_elapsed,
-            len(text),
-            self._target_entity,
-        )
-        return True, total_elapsed
-
-    except Exception as fast_exc:
-        logger.warning(
-            "↩️ HomePod router: fast path mc10 indisponible, fallback tts.speak: %r",
-            fast_exc,
-        )
-
-    try:
-        fallback_started = time.monotonic()
-        await asyncio.to_thread(self._call_home_assistant_legacy_sync, text)
-        fallback_elapsed = time.monotonic() - fallback_started
-        total_elapsed = time.monotonic() - started
-        logger.info(
-            "🏠 HomePod router: Morgan TTS accepté par fallback tts.speak "
-            "(%d caractères, fallback %.2fs, total %.2fs)",
-            len(text),
-            fallback_elapsed,
-            total_elapsed,
-        )
-        return True, total_elapsed
-    except Exception as exc:
-        total_elapsed = time.monotonic() - started
-        logger.warning(
-            "⚠️ HomePod router: échec Morgan TTS, fallback Voice PE après %.2fs: %r",
-            total_elapsed,
-            exc,
-        )
-        return False, total_elapsed
+            fallback_started = time.monotonic()
+            await asyncio.to_thread(self._call_home_assistant_legacy_sync, text)
+            fallback_elapsed = time.monotonic() - fallback_started
+            total_elapsed = time.monotonic() - started
+            logger.info(
+                "🏠 HomePod router: Morgan TTS accepté par fallback tts.speak "
+                "(%d caractères, fallback %.2fs, total %.2fs)",
+                len(text),
+                fallback_elapsed,
+                total_elapsed,
+            )
+            return True, total_elapsed
+        except Exception as exc:
+            total_elapsed = time.monotonic() - started
+            logger.warning(
+                "⚠️ HomePod router: échec Morgan TTS, fallback Voice PE après %.2fs: %r",
+                total_elapsed,
+                exc,
+            )
+            return False, total_elapsed
+    finally:
+        if not detached_play:
+            release_playback_lock()
 
 
 HomePodSpeechRouter.__init__ = _mc10_router_init
@@ -388,5 +471,6 @@ HomePodSpeechRouter._speak_on_homepod = _mc10_speak_on_homepod
 
 logger.info(
     "🚀 Maison Cognitive mc10 chargé: fillers 1.5s, réponses complètes 0.25s, "
-    "continuation 2.0s, diagnostic démarrage RAOP actif"
+    "continuation 2.0s, retour RAOP=%s, verrou AirPlay actif",
+    os.environ.get("HOMEPOD_EARLY_RETURN_ON_RAOP", "true"),
 )

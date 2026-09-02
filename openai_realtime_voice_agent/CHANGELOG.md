@@ -2,6 +2,15 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.6.3-mc16
+
+- **HomePod responses return as soon as the current AirPlay stream is confirmed
+  playing.** A per-HomePod lock keeps the underlying `play_media` request
+  serialized until it really ends, preventing the `already streaming` race
+  observed when the follow-up conversation starts quickly.
+- The RAOP probe now requires the exact media URL requested by Morgan, so an
+  unrelated HomePod announcement cannot be mistaken for this response.
+
 ## 0.6.2-mc15
 
 - **Follow-up conversation works with HomePod routing.** After a successful

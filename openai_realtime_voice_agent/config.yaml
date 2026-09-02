@@ -1,5 +1,5 @@
 name: OpenAI Realtime 2 Voice Agent
-version: "0.6.2-mc15"
+version: "0.6.3-mc16"
 slug: openai_realtime_voice_agent
 description: Talk to your home with OpenAI gpt-realtime-2 — a voice agent for the Home Assistant Voice PE, with live device control and web search.
 url: https://github.com/madmindkev/ha-openai-realtime
@@ -63,6 +63,10 @@ options:
   homepod_tts_startup_seconds: 0.8
   homepod_tts_min_seconds: 1.4
   homepod_tts_max_seconds: 30.0
+  # Return as soon as this request is confirmed playing on the HomePod. The
+  # per-HomePod lock keeps the underlying AirPlay call serialized in the
+  # background, so follow-up can reopen without an overlapping RAOP stream.
+  homepod_early_return_on_raop: true
 
   ha_mcp_url: ""
   longlived_token: ""
@@ -110,6 +114,7 @@ schema:
   homepod_tts_startup_seconds: float(0,10)
   homepod_tts_min_seconds: float(0.2,60)
   homepod_tts_max_seconds: float(1,120)
+  homepod_early_return_on_raop: bool
   ha_mcp_url: str
   longlived_token: password
   mcp_tool_allowlist: str
