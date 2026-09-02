@@ -546,6 +546,11 @@ class WebSocketHandler:
                     timeout_seconds=float(
                         os.environ.get("HOMEPOD_TIMEOUT_SECONDS", "30.0")
                     ),
+                    follow_up_callback=(
+                        (lambda: self.broadcast_json({"type": "request_follow_up"}))
+                        if self.follow_up_ms > 0
+                        else None
+                    ),
                 )
             )
 

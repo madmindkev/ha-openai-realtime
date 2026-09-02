@@ -93,6 +93,7 @@ class HomePodSpeechRouter(FrameProcessor):
         tts_entity: str = "tts.maison_cognitive_morgan_maison_cognitive_morgan",
         ha_api_base: str = "http://supervisor/core/api",
         timeout_seconds: float = 30.0,
+        follow_up_callback=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -108,6 +109,10 @@ class HomePodSpeechRouter(FrameProcessor):
         self._tts_entity = tts_entity
         self._ha_api_base = ha_api_base.rstrip("/")
         self._timeout_seconds = float(timeout_seconds)
+        # The Voice PE does not see Morgan's HomePod audio. The callback lets
+        # the websocket layer explicitly open its follow-up mic after a
+        # successful HomePod turn instead of relying on local PCM playback.
+        self._follow_up_callback = follow_up_callback
 
         # Current LLM response state.
         self._response_active = False

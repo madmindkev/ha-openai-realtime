@@ -2,6 +2,14 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.6.2-mc15
+
+- **Follow-up conversation works with HomePod routing.** After a successful
+  Morgan response, the backend explicitly asks the Voice PE to open its
+  follow-up microphone. This is necessary because the local Voice PE PCM is
+  intentionally suppressed when the Salon HomePod speaks, so an idle phase
+  alone cannot trigger the firmware's natural follow-up guard.
+
 ## 0.6.2-mc14
 
 - **HomePod replies survive volume-control failures.** A temporary pyatv/MRP

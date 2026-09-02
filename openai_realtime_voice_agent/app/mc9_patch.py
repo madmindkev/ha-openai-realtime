@@ -130,6 +130,22 @@ async def _mc9_route_with_replying_phase(self, text, direction):
                 f"({call_elapsed:.1f}s >= estimation {estimated:.1f}s), "
                 "aucune attente supplémentaire"
             )
+        if routed and self._follow_up_callback is not None:
+            try:
+                # Le Voice PE ne joue volontairement aucun PCM local quand
+                # Morgan est diffusé sur le HomePod. Demander explicitement
+                # son follow-up mic évite que le firmware interprète le tour
+                # comme une réponse sans audio et exige un nouveau wake word.
+                await self._follow_up_callback()
+                logger.info(
+                    "🔁 HomePod router: follow-up Voice PE demandé après "
+                    "la réponse Morgan"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "⚠️ HomePod router: impossible de demander le follow-up: %r",
+                    exc,
+                )
         return True
     finally:
         stop_frame = BotStoppedSpeakingFrame()
