@@ -2,6 +2,14 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.6.2-mc14
+
+- **HomePod replies survive volume-control failures.** A temporary pyatv/MRP
+  `volume_set` timeout is now logged and detached instead of aborting Morgan's
+  TTS route. The requested volume is still applied when Home Assistant answers
+  promptly, while `tts_get_url` and AirPlay playback continue without waiting
+  several seconds on a sick HomePod volume endpoint.
+
 ## 0.6.0
 
 > ⚠️ **This update has two parts — please update both:**
