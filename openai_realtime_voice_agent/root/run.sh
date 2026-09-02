@@ -42,6 +42,7 @@ HOMEPOD_TTS_STARTUP_SECONDS=$(bashio::config 'homepod_tts_startup_seconds')
 HOMEPOD_TTS_MIN_SECONDS=$(bashio::config 'homepod_tts_min_seconds')
 HOMEPOD_TTS_MAX_SECONDS=$(bashio::config 'homepod_tts_max_seconds')
 HOMEPOD_EARLY_RETURN_ON_RAOP=$(bashio::config 'homepod_early_return_on_raop')
+HOMEPOD_EARLY_RETURN_GRACE_SECONDS=$(bashio::config 'homepod_early_return_grace_seconds')
 
 # --- 🏠 Home Assistant ---
 HA_MCP_URL=$(bashio::config 'ha_mcp_url')
@@ -96,6 +97,7 @@ export HOMEPOD_TTS_STARTUP_SECONDS
 export HOMEPOD_TTS_MIN_SECONDS
 export HOMEPOD_TTS_MAX_SECONDS
 export HOMEPOD_EARLY_RETURN_ON_RAOP
+export HOMEPOD_EARLY_RETURN_GRACE_SECONDS
 export LONGLIVED_TOKEN
 export MCP_TOOL_ALLOWLIST
 export WEBSOCKET_PORT

@@ -2,6 +2,13 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.6.4-mc17
+
+- Return the Voice PE conversation after a bounded 2.5-second AirPlay hand-off
+  when Home Assistant keeps `play_media` open without exposing a usable RAOP
+  state transition. The underlying call remains serialized per HomePod and
+  late failures stay logged.
+
 ## 0.6.3-mc16
 
 - **HomePod responses return as soon as the current AirPlay stream is confirmed

@@ -81,6 +81,13 @@ def _mc10_router_init(self, *args, **kwargs):
     self._mc10_early_return_on_raop = _mc10_env_bool(
         "HOMEPOD_EARLY_RETURN_ON_RAOP", True
     )
+    # Home Assistant's Apple TV service keeps the HTTP request open until the
+    # whole AirPlay file has finished.  Some versions do not expose a useful
+    # playing/media_content_id transition while that request is open, so use a
+    # conservative grace period as a second, bounded hand-off signal.
+    self._mc10_early_return_grace_seconds = _mc10_env_float(
+        "HOMEPOD_EARLY_RETURN_GRACE_SECONDS", 2.5, minimum=0.5
+    )
     # pyatv permits only one RAOP stream per HomePod. Keep the HTTP
     # play_media call serialized even when the foreground coroutine returns
     # as soon as the current stream is confirmed playing.
@@ -370,7 +377,9 @@ async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
             try:
                 if self._mc10_early_return_on_raop:
                     done, _ = await asyncio.wait(
-                        {play_task, probe_task}, return_when=asyncio.FIRST_COMPLETED
+                        {play_task, probe_task},
+                        timeout=self._mc10_early_return_grace_seconds,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
                     if probe_task in done and not play_task.done():
                         try:
@@ -392,6 +401,34 @@ async def _mc10_speak_on_homepod(self, text: str) -> tuple[bool, float]:
                                 len(text),
                             )
                             return True, total_elapsed
+
+                    # The Apple TV integration can leave the entity state at
+                    # idle until the complete play_media call returns.  Do not
+                    # keep the conversation blocked for the whole audio file:
+                    # once the request has remained alive for the bounded grace
+                    # period, hand the foreground back and keep the HTTP call
+                    # serialized by the playback lock.  If the task completed
+                    # (successfully or with an error), the normal path below
+                    # still observes its real result and can use the fallback.
+                    if not play_task.done():
+                        if not probe_task.done():
+                            probe_task.cancel()
+                            try:
+                                await probe_task
+                            except asyncio.CancelledError:
+                                pass
+                        detached_play = True
+                        play_task.add_done_callback(_log_detached_play)
+                        play_task.add_done_callback(release_playback_lock)
+                        total_elapsed = time.monotonic() - started
+                        logger.info(
+                            "⏱️ HomePod router: retour prudent après %.2fs sans état "
+                            "RAOP exploitable (play_media maintenu en arrière-plan; "
+                            "%d car.)",
+                            total_elapsed,
+                            len(text),
+                        )
+                        return True, total_elapsed
 
                 await play_task
             finally:
